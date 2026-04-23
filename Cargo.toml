@@ -1,0 +1,7 @@
+[package]
+name = "aura-epics"
+description = "An Autonomous, High-Performance, Memory-Safe Archiving Engine for EPICS-based Scientific Control Systems"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
