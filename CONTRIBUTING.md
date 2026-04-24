@@ -26,17 +26,17 @@ Please be respectful, constructive, and professional in all interactions.
 AURA is a high performance, entropy-driven archiving engine for EPICS control systems, written in Rust. Before contributing, we recommend:
 
 1. Reading the [project paper](docs/aura-project.pdf) to understand the architecture and goals
-2. Familiarizing yourself with [EPICS](https://epics-controls.org/) and the [Channel Access protocol](https://docs.epics-controls.org/en/latest/pv-access/protocol.html)
+2. Familiarizing yourself with [EPICS](https://epics-controls.org/) and the [PV Access protocol](https://docs.epics-controls.org/en/latest/pv-access/overview.html)
 3. Having a working knowledge of Rust and async programming with [Tokio](https://tokio.rs/)
 
 ## Development Setup
 
 ### Prerequisites
 
-- **Rust** >= 1.75 (install via [rustup](https://rustup.rs/))
+- **Rust** >= 1.93 (install via [rustup](https://rustup.rs/))
 - **EPICS Base** >= 7.0 (for testing against real IOCs)
-- **PostgreSQL** >= 16 (with [TimescaleDB](https://github.com/timescale/timescaledb) extension)
-- **Redis** >= 8.0 (used as message broker and real-time cache)
+- **PostgreSQL** >= 18 (with [TimescaleDB](https://github.com/timescale/timescaledb) extension)
+- **Redis** >= 8.6 (used as message broker and real-time cache)
 
 ## How to Contribute
 

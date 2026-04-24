@@ -20,7 +20,7 @@
     <img src="https://img.shields.io/badge/language-Rust-orange?style=flat-square&logo=rust" alt="Rust">
     <img src="https://img.shields.io/badge/runtime-Tokio-blue?style=flat-square" alt="Tokio">
     <img src="https://img.shields.io/badge/storage-TimeScaleDB-green?style=flat-square" alt="TimeScaleDB">
-    <img src="https://img.shields.io/badge/protocol-Channel%20Access-blueviolet?style=flat-square" alt="CA">
+    <img src="https://img.shields.io/badge/protocol-PV%20Access-blueviolet?style=flat-square" alt="CA">
     <img src="https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square" alt="License">
   </p>
 </div>
