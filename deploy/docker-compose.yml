@@ -1,0 +1,37 @@
+services:
+  database:
+    image: timescale/timescaledb:2.26.3-pg18
+    container_name: aura-db
+    restart: always
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - aura_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8.6.2
+    container_name: aura-redis
+    restart: always
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT}:6379"
+    volumes:
+      - aura_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  aura_db_data:
+  aura_redis_data:
