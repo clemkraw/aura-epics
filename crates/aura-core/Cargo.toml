@@ -6,3 +6,4 @@ description = "Shared types, configuration, and error handling for AURA-EPICS"
 license = "MIT"
 
 [dependencies]
+thiserror = "2.0.18"
