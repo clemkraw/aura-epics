@@ -6,4 +6,5 @@ description = "Shared types, configuration, and error handling for AURA-EPICS"
 license = "MIT"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 thiserror = "2.0.18"
