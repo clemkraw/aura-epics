@@ -1,7 +1,30 @@
+[workspace]
+members = [
+    "crates/aura-core",
+    "crates/aura-net",
+    "crates/aura-discover",
+    "crates/aura-ingest",
+    "crates/aura-store",
+    "crates/aura-api",
+]
+resolver = "2"
+
 [package]
 name = "aura-epics"
-description = "An Autonomous, High-Performance, Memory-Safe Archiving Engine for EPICS-based Scientific Control Systems"
 version = "0.1.0"
 edition = "2024"
+description = "Autonomous Universal Rust Archiver for EPICS Control Systems"
+license = "MIT"
+default-run = "aura"
+
+[[bin]]
+name = "aura"
+path = "src/main.rs"
 
 [dependencies]
+aura-core = { path = "crates/aura-core" }
+aura-net = { path = "crates/aura-net" }
+aura-discover = { path = "crates/aura-discover" }
+aura-ingest = { path = "crates/aura-ingest" }
+aura-store = { path = "crates/aura-store" }
+aura-api = { path = "crates/aura-api" }

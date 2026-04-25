@@ -1,0 +1,10 @@
+[package]
+name = "aura-api"
+version = "0.1.0"
+edition = "2024"
+description = "AURA REST API server for data retrieval and system monitoring"
+license = "Apache-2.0"
+
+[dependencies]
+aura-core = { path = "../aura-core" }
+aura-store = { path = "../aura-store" }

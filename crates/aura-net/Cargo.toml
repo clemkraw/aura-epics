@@ -1,0 +1,8 @@
+[package]
+name = "aura-net"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust PVAccess (PVXS) protocol implementation for EPICS 7"
+license = "MIT"
+
+[dependencies]

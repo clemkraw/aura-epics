@@ -1,0 +1,8 @@
+[package]
+name = "aura-core"
+version = "0.1.0"
+edition = "2024"
+description = "Shared types, configuration, and error handling for AURA-EPICS"
+license = "MIT"
+
+[dependencies]

@@ -2,3 +2,10 @@
 data/
 
 .env
+
+crates/aura-core/target
+crates/aura-api/target
+crates/aura-discover/target
+crates/aura-ingest/target
+crates/aura-net/target
+crates/aura-store/target
