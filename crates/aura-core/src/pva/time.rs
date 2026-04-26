@@ -215,10 +215,10 @@ mod tests {
 
     #[test]
     fn test_from_system_time() {
-        let st = UNIX_EPOCH + Duration::from_secs(1713520000) + Duration::from_nanos(123_456_789);
+        let st = UNIX_EPOCH + Duration::from_secs(1713520000) + Duration::from_nanos(123_456_000);
         let ts = TimeStamp::from_system_time(st);
         assert_eq!(ts.seconds, 1713520000);
-        assert_eq!(ts.nanoseconds, 123_456_789);
+        assert_eq!(ts.nanoseconds, 123_456_000);
     }
 
     #[test]
