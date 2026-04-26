@@ -8,5 +8,7 @@
 //! NTURI is omitted (RPC request type, not archivable data).
 
 pub mod alarm;
+pub mod scalars;
 
 pub use alarm::{Alarm, AlarmSeverity, AlarmStatus};
+pub use scalars::{ScalarType, ScalarValue};
