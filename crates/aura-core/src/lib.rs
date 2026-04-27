@@ -5,6 +5,16 @@
 //! ```
 
 pub mod error;
+pub mod pva;
 
-// ── Re-exports ───────────────────────────────────────────────────────
 pub use error::{AuraError, AuraResult};
+
+pub use pva::{
+    Alarm, AlarmSeverity, AlarmStatus, ArrayValue, Codec, Control,
+    CustomStructure, Dimension, Display, DisplayForm, EnumValue,
+    HistogramValue, NTAggregate, NTContinuum, NTEnum, NTHistogram,
+    NTMatrix, NTMultiChannel, NTNDArray, NTNameValue, NTScalar,
+    NTScalarArray, NTTable, NTUnion, NdAttribute, NormativeType,
+    PvDataType, ScalarType, ScalarValue, TableColumn, TimeStamp,
+    UnionValue, ValueAlarm,
+};
