@@ -316,7 +316,9 @@ impl PvMetadata {
     }
 
     fn apply_display(&mut self, d: &Display) {
-        self.description = d.description.clone();
+        if !d.description.is_empty() {
+            self.description = d.description.clone();
+        }
         self.units = d.units.clone();
         self.precision = d.precision;
         self.display_form = d.form;
@@ -411,5 +413,580 @@ impl std::fmt::Display for PvMetadata {
             write!(f, " {}D:{}", self.dimensions.len(), dims.join("×"))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts() -> TimeStamp { TimeStamp::new(0, 0) }
+
+    fn full_display() -> Display {
+        Display {
+            limit_low: 0.0, limit_high: 100.0,
+            description: "Cryo temp".into(), units: "K".into(),
+            precision: 3, form: DisplayForm::Default,
+        }
+    }
+
+    fn full_control() -> Control {
+        Control { limit_low: 0.0, limit_high: 50.0, min_step: 0.001 }
+    }
+
+    fn full_value_alarm() -> ValueAlarm {
+        ValueAlarm::symmetric(10.0, 2.0, 5.0)
+    }
+
+    fn make_scalar_nt() -> NormativeType {
+        NormativeType::NTScalar(NTScalar {
+            value: ScalarValue::Double(4.217),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: Some(full_display()),
+            control: Some(full_control()),
+            value_alarm: Some(full_value_alarm()),
+        })
+    }
+
+    // ── from_initial_update: all 13 NT variants ──────────────────────
+
+    #[test]
+    fn test_from_scalar_double() {
+        let meta = PvMetadata::from_initial_update("CRYO:TEMP", &make_scalar_nt());
+        assert_eq!(meta.pv_name, "CRYO:TEMP");
+        assert_eq!(meta.data_type, PvDataType::Scalar);
+        assert_eq!(meta.scalar_type, Some(ScalarType::Double));
+        assert_eq!(meta.units, "K");
+        assert_eq!(meta.precision, 3);
+        assert_eq!(meta.description, "Cryo temp");
+        assert_eq!(meta.display_high, 100.0);
+        assert_eq!(meta.control_high, 50.0);
+        assert_eq!(meta.min_step, 0.001);
+        assert_eq!(meta.alarm_hihi, 15.0);
+        assert_eq!(meta.alarm_low, 8.0);
+        assert!(meta.first_seen.is_some());
+    }
+
+    #[test]
+    fn test_from_scalar_string() {
+        let nt = NormativeType::NTScalar(NTScalar {
+            value: ScalarValue::String("hello".into()),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: None, control: None, value_alarm: None,
+        });
+        let meta = PvMetadata::from_initial_update("STR:PV", &nt);
+        assert_eq!(meta.data_type, PvDataType::String);
+        assert_eq!(meta.scalar_type, Some(ScalarType::String));
+    }
+
+    #[test]
+    fn test_from_scalar_no_metadata() {
+        let nt = NormativeType::NTScalar(NTScalar {
+            value: ScalarValue::Int(42),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: None, control: None, value_alarm: None,
+        });
+        let meta = PvMetadata::from_initial_update("BARE:PV", &nt);
+        assert_eq!(meta.units, "");
+        assert_eq!(meta.precision, 0);
+        assert_eq!(meta.alarm_hihi, 0.0);
+        assert!(!meta.has_display_range());
+        assert!(!meta.has_control_range());
+        assert!(!meta.has_alarm_limits());
+    }
+
+    #[test]
+    fn test_from_enum() {
+        let nt = NormativeType::NTEnum(NTEnum {
+            value: EnumValue::from_strs(0, &["Open", "Closed", "Fault"]),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("VALVE:ST", &nt);
+        assert_eq!(meta.data_type, PvDataType::Scalar);
+        assert_eq!(meta.scalar_type, Some(ScalarType::Int));
+        assert_eq!(meta.enum_choices, vec!["Open", "Closed", "Fault"]);
+        assert!(meta.is_enum());
+    }
+
+    #[test]
+    fn test_from_scalar_array() {
+        let nt = NormativeType::NTScalarArray(NTScalarArray {
+            value: ArrayValue::DoubleArray(vec![0.0; 1024]),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: Some(Display::new("V", 2)),
+            control: None, value_alarm: None,
+        });
+        let meta = PvMetadata::from_initial_update("SCOPE:WAVE", &nt);
+        assert_eq!(meta.data_type, PvDataType::Array);
+        assert_eq!(meta.scalar_type, Some(ScalarType::Double));
+        assert_eq!(meta.array_size, Some(1024));
+        assert_eq!(meta.units, "V");
+        assert_eq!(meta.precision, 2);
+    }
+
+    #[test]
+    fn test_from_matrix() {
+        let nt = NormativeType::NTMatrix(NTMatrix {
+            value: vec![1.0; 6], dim: vec![2, 3],
+            descriptor: "response".into(),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: Some(Display::new("mm", 1)),
+        });
+        let meta = PvMetadata::from_initial_update("OPT:RESP", &nt);
+        assert_eq!(meta.data_type, PvDataType::Matrix);
+        assert_eq!(meta.scalar_type, Some(ScalarType::Double));
+        assert_eq!(meta.array_size, Some(6));
+        assert_eq!(meta.description, "response");
+        assert_eq!(meta.units, "mm");
+        assert_eq!(meta.dimensions.len(), 2);
+        assert_eq!(meta.dimensions[0].size, 2);
+        assert_eq!(meta.dimensions[1].size, 3);
+    }
+
+    #[test]
+    fn test_from_matrix_no_dim() {
+        let nt = NormativeType::NTMatrix(NTMatrix {
+            value: vec![1.0, 2.0, 3.0], dim: vec![],
+            descriptor: String::new(),
+            alarm: Alarm::default(), timestamp: ts(), display: None,
+        });
+        let meta = PvMetadata::from_initial_update("VEC:PV", &nt);
+        assert!(meta.dimensions.is_empty()); // no dim → no dimensions
+    }
+
+    #[test]
+    fn test_from_histogram() {
+        let nt = NormativeType::NTHistogram(NTHistogram {
+            ranges: vec![0.0, 1.0, 2.0, 3.0],
+            value: HistogramValue::Int(vec![10, 20, 30]),
+            descriptor: "beam profile".into(),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("DIAG:HIST", &nt);
+        assert_eq!(meta.data_type, PvDataType::Histogram);
+        assert_eq!(meta.description, "beam profile");
+        assert_eq!(meta.array_size, Some(3));
+    }
+
+    #[test]
+    fn test_from_continuum() {
+        let nt = NormativeType::NTContinuum(NTContinuum {
+            base: vec![0.0, 1.0, 2.0],
+            value: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            units: vec!["s".into(), "V".into(), "A".into()],
+            descriptor: "VI curve".into(),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("DIAG:VI", &nt);
+        assert_eq!(meta.data_type, PvDataType::Continuum);
+        assert_eq!(meta.scalar_type, Some(ScalarType::Double));
+        assert_eq!(meta.description, "VI curve");
+        assert_eq!(meta.array_size, Some(3));
+        assert_eq!(meta.units, "s"); // base unit
+    }
+
+    #[test]
+    fn test_from_continuum_no_units() {
+        let nt = NormativeType::NTContinuum(NTContinuum {
+            base: vec![0.0], value: vec![1.0],
+            units: vec![], descriptor: String::new(),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("PV", &nt);
+        assert_eq!(meta.units, "");
+    }
+
+    #[test]
+    fn test_from_name_value() {
+        let nt = NormativeType::NTNameValue(NTNameValue {
+            name: vec!["gain".into(), "offset".into()],
+            value: ArrayValue::DoubleArray(vec![1.5, -0.3]),
+            descriptor: "amp settings".into(),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("AMP:CONF", &nt);
+        assert_eq!(meta.data_type, PvDataType::NameValue);
+        assert_eq!(meta.description, "amp settings");
+        assert_eq!(meta.array_size, Some(2));
+        assert_eq!(meta.scalar_type, Some(ScalarType::Double));
+    }
+
+    #[test]
+    fn test_from_table() {
+        let nt = NormativeType::NTTable(NTTable {
+            labels: vec!["x".into(), "y".into()],
+            columns: vec![
+                TableColumn::new("x", ArrayValue::DoubleArray(vec![1.0, 2.0])),
+                TableColumn::new("y", ArrayValue::DoubleArray(vec![3.0, 4.0])),
+            ],
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("TBL:PV", &nt);
+        assert_eq!(meta.data_type, PvDataType::Table);
+        assert_eq!(meta.array_size, Some(2)); // 2 rows
+    }
+
+    #[test]
+    fn test_from_ndarray() {
+        let nt = NormativeType::NTNDArray(NTNDArray {
+            value: ArrayValue::UByteArray(vec![0; 640 * 480]),
+            codec: Codec::default(),
+            compressed_size: 0, uncompressed_size: 640 * 480,
+            dimension: vec![Dimension::new(640), Dimension::new(480)],
+            unique_id: 1, data_timestamp: None,
+            alarm: Alarm::default(), timestamp: ts(),
+            attribute: vec![],
+        });
+        let meta = PvMetadata::from_initial_update("CAM:IMG", &nt);
+        assert_eq!(meta.data_type, PvDataType::Image);
+        assert_eq!(meta.scalar_type, Some(ScalarType::UByte));
+        assert_eq!(meta.dimensions.len(), 2);
+        assert_eq!(meta.dimensions[0].size, 640);
+        assert_eq!(meta.dimensions[1].size, 480);
+        assert!(meta.is_image());
+    }
+
+    #[test]
+    fn test_from_multichannel() {
+        let nt = NormativeType::NTMultiChannel(NTMultiChannel {
+            values: vec![ScalarValue::Double(1.0), ScalarValue::Double(2.0)],
+            channel_name: vec!["PV:A".into(), "PV:B".into()],
+            is_connected: vec![true, true],
+            severity: vec![], status: vec![], message: vec![],
+            seconds_past_epoch: vec![], nanoseconds: vec![],
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("GRP:PV", &nt);
+        assert_eq!(meta.data_type, PvDataType::MultiChannel);
+        assert_eq!(meta.array_size, Some(2));
+    }
+
+    #[test]
+    fn test_from_aggregate() {
+        let nt = NormativeType::NTAggregate(NTAggregate {
+            value: 4.2, n: 100, dispersion: 0.01,
+            first: 4.1, last: 4.3, max: 4.5, min: 3.9,
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("AGG:PV", &nt);
+        assert_eq!(meta.data_type, PvDataType::Aggregate);
+        assert_eq!(meta.scalar_type, Some(ScalarType::Double));
+    }
+
+    #[test]
+    fn test_from_union_scalar() {
+        let nt = NormativeType::NTUnion(NTUnion {
+            value: UnionValue::Scalar(ScalarValue::Double(1.0)),
+            descriptor: "flex pv".into(),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("UNI:PV", &nt);
+        assert_eq!(meta.data_type, PvDataType::Union);
+        assert_eq!(meta.scalar_type, Some(ScalarType::Double));
+        assert_eq!(meta.description, "flex pv");
+    }
+
+    #[test]
+    fn test_from_union_array() {
+        let nt = NormativeType::NTUnion(NTUnion {
+            value: UnionValue::Array(ArrayValue::IntArray(vec![1, 2])),
+            descriptor: String::new(),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("UNI:ARR", &nt);
+        assert_eq!(meta.scalar_type, None); // not a scalar union
+    }
+
+    #[test]
+    fn test_from_custom() {
+        let nt = NormativeType::Custom(CustomStructure {
+            data: serde_json::json!({"x": 1}),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("CUST:PV", &nt);
+        assert_eq!(meta.data_type, PvDataType::Custom);
+        assert_eq!(meta.scalar_type, None);
+        assert!(meta.description.is_empty());
+    }
+
+    // ── update_from ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_update_no_change() {
+        let nt = make_scalar_nt();
+        let mut meta = PvMetadata::from_initial_update("PV", &nt);
+        assert!(!meta.update_from(&nt));
+    }
+
+    #[test]
+    fn test_update_display_changed() {
+        let mut meta = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        let nt2 = NormativeType::NTScalar(NTScalar {
+            value: ScalarValue::Double(0.0),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: Some(Display { units: "degC".into(), ..Display::default() }),
+            control: None, value_alarm: None,
+        });
+        assert!(meta.update_from(&nt2));
+        assert_eq!(meta.units, "degC");
+        assert!(meta.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_update_alarm_changed() {
+        let mut meta = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        let nt2 = NormativeType::NTScalar(NTScalar {
+            value: ScalarValue::Double(0.0),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: Some(full_display()),
+            control: Some(full_control()),
+            value_alarm: Some(ValueAlarm::symmetric(20.0, 3.0, 8.0)), // changed
+        });
+        assert!(meta.update_from(&nt2));
+        assert_eq!(meta.alarm_hihi, 28.0); // 20 + 8
+    }
+
+    #[test]
+    fn test_update_enum_choices_changed() {
+        let nt = NormativeType::NTEnum(NTEnum {
+            value: EnumValue::from_strs(0, &["A", "B"]),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let mut meta = PvMetadata::from_initial_update("PV", &nt);
+
+        let nt2 = NormativeType::NTEnum(NTEnum {
+            value: EnumValue::from_strs(0, &["A", "B", "C"]), // added C
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        assert!(meta.update_from(&nt2));
+        assert_eq!(meta.enum_choices, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn test_update_array_size_changed() {
+        let nt = NormativeType::NTScalarArray(NTScalarArray {
+            value: ArrayValue::DoubleArray(vec![0.0; 100]),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: None, control: None, value_alarm: None,
+        });
+        let mut meta = PvMetadata::from_initial_update("PV", &nt);
+
+        let nt2 = NormativeType::NTScalarArray(NTScalarArray {
+            value: ArrayValue::DoubleArray(vec![0.0; 200]), // resized
+            alarm: Alarm::default(), timestamp: ts(),
+            display: None, control: None, value_alarm: None,
+        });
+        assert!(meta.update_from(&nt2));
+        assert_eq!(meta.array_size, Some(200));
+    }
+
+    #[test]
+    fn test_update_ndarray_dimensions_changed() {
+        let nt = NormativeType::NTNDArray(NTNDArray {
+            value: ArrayValue::UByteArray(vec![]),
+            codec: Codec::default(),
+            compressed_size: 0, uncompressed_size: 0,
+            dimension: vec![Dimension::new(640), Dimension::new(480)],
+            unique_id: 0, data_timestamp: None,
+            alarm: Alarm::default(), timestamp: ts(), attribute: vec![],
+        });
+        let mut meta = PvMetadata::from_initial_update("CAM", &nt);
+
+        let nt2 = NormativeType::NTNDArray(NTNDArray {
+            value: ArrayValue::UByteArray(vec![]),
+            codec: Codec::default(),
+            compressed_size: 0, uncompressed_size: 0,
+            dimension: vec![Dimension::new(1024), Dimension::new(768)], // ROI changed
+            unique_id: 1, data_timestamp: None,
+            alarm: Alarm::default(), timestamp: ts(), attribute: vec![],
+        });
+        assert!(meta.update_from(&nt2));
+        assert_eq!(meta.dimensions[0].size, 1024);
+    }
+
+    #[test]
+    fn test_update_matrix_display_changed() {
+        let nt = NormativeType::NTMatrix(NTMatrix {
+            value: vec![1.0; 4], dim: vec![2, 2],
+            descriptor: String::new(),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: Some(Display::new("mm", 1)),
+        });
+        let mut meta = PvMetadata::from_initial_update("MTX", &nt);
+
+        let nt2 = NormativeType::NTMatrix(NTMatrix {
+            value: vec![1.0; 4], dim: vec![2, 2],
+            descriptor: String::new(),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: Some(Display::new("µm", 3)), // changed
+        });
+        assert!(meta.update_from(&nt2));
+        assert_eq!(meta.units, "µm");
+        assert_eq!(meta.precision, 3);
+    }
+
+    #[test]
+    fn test_update_unhandled_type_no_change() {
+        let nt = NormativeType::NTAggregate(NTAggregate {
+            value: 1.0, n: 1, dispersion: 0.0,
+            first: 1.0, last: 1.0, max: 1.0, min: 1.0,
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let mut meta = PvMetadata::from_initial_update("AGG", &nt);
+        assert!(!meta.update_from(&nt)); // aggregate has no updatable metadata
+    }
+
+    // ── Helper methods ───────────────────────────────────────────────
+
+    #[test]
+    fn test_has_display_range() {
+        let meta = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        assert!(meta.has_display_range()); // 0..100
+    }
+
+    #[test]
+    fn test_has_control_range() {
+        let meta = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        assert!(meta.has_control_range()); // 0..50
+    }
+
+    #[test]
+    fn test_has_alarm_limits() {
+        let meta = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        assert!(meta.has_alarm_limits());
+    }
+
+    #[test]
+    fn test_no_alarm_limits_when_zero() {
+        let nt = NormativeType::NTScalar(NTScalar {
+            value: ScalarValue::Double(0.0),
+            alarm: Alarm::default(), timestamp: ts(),
+            display: None, control: None, value_alarm: None,
+        });
+        let meta = PvMetadata::from_initial_update("PV", &nt);
+        assert!(!meta.has_alarm_limits());
+    }
+
+    #[test]
+    fn test_is_enum() {
+        let nt = NormativeType::NTEnum(NTEnum {
+            value: EnumValue::from_strs(0, &["A"]),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("PV", &nt);
+        assert!(meta.is_enum());
+
+        let meta2 = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        assert!(!meta2.is_enum());
+    }
+
+    #[test]
+    fn test_is_image() {
+        let nt = NormativeType::NTNDArray(NTNDArray {
+            value: ArrayValue::UByteArray(vec![]),
+            codec: Codec::default(),
+            compressed_size: 0, uncompressed_size: 0,
+            dimension: vec![Dimension::new(1)],
+            unique_id: 0, data_timestamp: None,
+            alarm: Alarm::default(), timestamp: ts(), attribute: vec![],
+        });
+        let meta = PvMetadata::from_initial_update("CAM", &nt);
+        assert!(meta.is_image());
+
+        let meta2 = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        assert!(!meta2.is_image());
+    }
+
+    // ── Display ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_display_scalar() {
+        let meta = PvMetadata::from_initial_update("CRYO:T", &make_scalar_nt());
+        let s = meta.to_string();
+        assert!(s.contains("CRYO:T"));
+        assert!(s.contains("[K]"));
+    }
+
+    #[test]
+    fn test_display_enum() {
+        let nt = NormativeType::NTEnum(NTEnum {
+            value: EnumValue::from_strs(0, &["A", "B", "C"]),
+            alarm: Alarm::default(), timestamp: ts(),
+        });
+        let meta = PvMetadata::from_initial_update("VALVE", &nt);
+        assert!(meta.to_string().contains("enum:3"));
+    }
+
+    #[test]
+    fn test_display_image() {
+        let nt = NormativeType::NTNDArray(NTNDArray {
+            value: ArrayValue::UByteArray(vec![]),
+            codec: Codec::default(),
+            compressed_size: 0, uncompressed_size: 0,
+            dimension: vec![Dimension::new(1024), Dimension::new(768)],
+            unique_id: 0, data_timestamp: None,
+            alarm: Alarm::default(), timestamp: ts(), attribute: vec![],
+        });
+        let meta = PvMetadata::from_initial_update("CAM", &nt);
+        let s = meta.to_string();
+        assert!(s.contains("2D"));
+        assert!(s.contains("1024"));
+    }
+
+    // ── DimensionInfo ────────────────────────────────────────────────
+
+    #[test]
+    fn test_dimension_info_from_dimension() {
+        let d = Dimension::with_roi(512, 100, 1024);
+        let di = DimensionInfo::from_dimension(&d);
+        assert_eq!(di.size, 512);
+        assert_eq!(di.full_size, 1024);
+    }
+
+    #[test]
+    fn test_dimension_info_display_no_roi() {
+        let di = DimensionInfo { size: 1024, full_size: 1024 };
+        assert_eq!(di.to_string(), "1024");
+    }
+
+    #[test]
+    fn test_dimension_info_display_roi() {
+        let di = DimensionInfo { size: 512, full_size: 1024 };
+        assert_eq!(di.to_string(), "512/1024");
+    }
+
+    #[test]
+    fn test_dimension_info_eq() {
+        let a = DimensionInfo { size: 640, full_size: 640 };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    // ── Serde ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_serde_roundtrip() {
+        let meta = PvMetadata::from_initial_update("CRYO:T", &make_scalar_nt());
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: PvMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(meta.pv_name, back.pv_name);
+        assert_eq!(meta.data_type, back.data_type);
+        assert_eq!(meta.units, back.units);
+        assert_eq!(meta.alarm_hihi, back.alarm_hihi);
+    }
+
+    #[test]
+    fn test_serde_skips_none_pv_id() {
+        let meta = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("pv_id")); // skip_serializing_if
+    }
+
+    // ── Debug ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_debug() {
+        let meta = PvMetadata::from_initial_update("PV", &make_scalar_nt());
+        assert!(!format!("{:?}", meta).is_empty());
     }
 }
