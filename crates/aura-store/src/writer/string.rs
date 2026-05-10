@@ -339,3 +339,371 @@ impl fmt::Display for StringWriter {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn now() -> DateTime<Utc> { Utc::now() }
+    fn row(pv: i32, val: &str) -> StringRow { StringRow::new(now(), pv, val.to_string(), 0, 0) }
+    fn row_sev(pv: i32, val: &str, sev: i16) -> StringRow {
+        StringRow::new(now(), pv, val.to_string(), sev, 1)
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // StringRow
+    // ═════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_row_new() {
+        let r = row(1, "hello");
+        assert_eq!(r.pv_id, 1);
+        assert_eq!(r.value, "hello");
+        assert_eq!(r.value_len(), 5);
+        assert!(!r.is_value_empty());
+    }
+
+    #[test]
+    fn test_row_empty_value() {
+        let r = row(1, "");
+        assert!(r.is_value_empty());
+        assert_eq!(r.value_len(), 0);
+    }
+
+    #[test]
+    fn test_row_severity() {
+        let r = row_sev(1, "alarm", 2);
+        assert_eq!(r.severity, 2);
+        assert_eq!(r.status, 1);
+    }
+
+    #[test]
+    fn test_row_mem_size() {
+        assert_eq!(row(1, "hello").mem_size(), 45);
+        assert_eq!(row(1, "").mem_size(), 40);
+    }
+
+    #[test]
+    fn test_row_mem_size_large() {
+        let big = "x".repeat(10_000);
+        assert_eq!(row(1, &big).mem_size(), 40 + 10_000);
+    }
+
+    #[test]
+    fn test_row_clone() {
+        let a = row(1, "hello");
+        let b = a.clone();
+        assert_eq!(a.value, b.value);
+    }
+
+    #[test]
+    fn test_row_display_short() {
+        let s = row(42, "hello").to_string();
+        assert!(s.contains("pv_id=42"));
+        assert!(s.contains("\"hello\""));
+    }
+
+    #[test]
+    fn test_row_display_long() {
+        let s = row(1, &"a".repeat(100)).to_string();
+        assert!(s.contains("..."));
+        assert!(s.contains("100 bytes"));
+    }
+
+    #[test]
+    fn test_row_debug() {
+        assert!(format!("{:?}", row(1, "x")).contains("StringRow"));
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // PushResult
+    // ═════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_push_result_accepted() {
+        assert!(!PushResult::Accepted.needs_flush());
+        assert!(PushResult::Accepted.is_accepted());
+        assert_eq!(PushResult::Accepted.to_string(), "accepted");
+    }
+
+    #[test]
+    fn test_push_result_full() {
+        assert!(PushResult::Full.needs_flush());
+        assert!(PushResult::Full.is_accepted());
+    }
+
+    #[test]
+    fn test_push_result_backpressure() {
+        assert!(PushResult::BackpressureExceeded.needs_flush());
+        assert!(!PushResult::BackpressureExceeded.is_accepted());
+    }
+
+    #[test]
+    fn test_push_result_eq() {
+        assert_eq!(PushResult::Full, PushResult::Full);
+        assert_ne!(PushResult::Full, PushResult::Accepted);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // escape_copy_text
+    // ═════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_escape_plain() {
+        let mut out = String::new();
+        escape_copy_text("hello world", &mut out);
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn test_escape_tab() {
+        let mut out = String::new();
+        escape_copy_text("a\tb", &mut out);
+        assert_eq!(out, "a\\tb");
+    }
+
+    #[test]
+    fn test_escape_newline() {
+        let mut out = String::new();
+        escape_copy_text("line1\nline2", &mut out);
+        assert_eq!(out, "line1\\nline2");
+    }
+
+    #[test]
+    fn test_escape_carriage_return() {
+        let mut out = String::new();
+        escape_copy_text("a\rb", &mut out);
+        assert_eq!(out, "a\\rb");
+    }
+
+    #[test]
+    fn test_escape_backslash() {
+        let mut out = String::new();
+        escape_copy_text("path\\to\\file", &mut out);
+        assert_eq!(out, "path\\\\to\\\\file");
+    }
+
+    #[test]
+    fn test_escape_combined() {
+        let mut out = String::new();
+        escape_copy_text("a\t\n\r\\b", &mut out);
+        assert_eq!(out, "a\\t\\n\\r\\\\b");
+    }
+
+    #[test]
+    fn test_escape_empty() {
+        let mut out = String::new();
+        escape_copy_text("", &mut out);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn test_escape_unicode() {
+        let mut out = String::new();
+        escape_copy_text("température: 4.2°K", &mut out);
+        assert_eq!(out, "température: 4.2°K");
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // StringWriter — Construction
+    // ═════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_new_defaults() {
+        let w = StringWriter::with_defaults();
+        assert!(w.is_empty());
+        assert_eq!(w.batch_size(), 500);
+        assert_eq!(w.max_buffer_bytes(), DEFAULT_MAX_BUFFER_BYTES);
+        assert_eq!(w.buffered_bytes(), 0);
+        assert_eq!(w.memory_pressure(), 0.0);
+        assert_eq!(w.total_written(), 0);
+        assert_eq!(w.total_flushes(), 0);
+        assert_eq!(w.total_value_bytes(), 0);
+        assert_eq!(w.total_backpressure(), 0);
+        assert_eq!(w.copy_flushes(), 0);
+        assert_eq!(w.insert_flushes(), 0);
+    }
+
+    #[test]
+    fn test_custom_limits() {
+        let w = StringWriter::with_limits(100, 1024 * 1024);
+        assert_eq!(w.batch_size(), 100);
+        assert_eq!(w.max_buffer_bytes(), 1024 * 1024);
+    }
+
+    #[test]
+    fn test_min_batch_size() {
+        assert_eq!(StringWriter::new(0).batch_size(), 1);
+    }
+
+    #[test]
+    fn test_min_buffer_bytes() {
+        assert_eq!(StringWriter::with_limits(10, 0).max_buffer_bytes(), 1024);
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // StringWriter — Push
+    // ═════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_push_accepted() {
+        let mut w = StringWriter::with_defaults();
+        assert_eq!(w.push(row(1, "hello")), PushResult::Accepted);
+        assert_eq!(w.buffered(), 1);
+        assert_eq!(w.buffered_bytes(), 45);
+    }
+
+    #[test]
+    fn test_push_until_full() {
+        let mut w = StringWriter::new(3);
+        assert_eq!(w.push(row(1, "a")), PushResult::Accepted);
+        assert_eq!(w.push(row(2, "b")), PushResult::Accepted);
+        assert_eq!(w.push(row(3, "c")), PushResult::Full);
+        assert!(w.is_full());
+    }
+
+    // ── Backpressure ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_backpressure_triggered() {
+        let mut w = StringWriter::with_limits(100, 100);
+        assert_eq!(w.push(row(1, "hello")), PushResult::Accepted); // 45 bytes
+        assert_eq!(w.push(row(2, "world")), PushResult::Accepted); // 90 bytes
+        assert_eq!(w.push(row(3, "!!!!!")), PushResult::BackpressureExceeded); // 135 > 100
+        assert_eq!(w.buffered(), 2);
+        assert_eq!(w.total_backpressure(), 1);
+    }
+
+    #[test]
+    fn test_backpressure_first_row_always_accepted() {
+        let mut w = StringWriter::with_limits(100, 10);
+        let r = w.push(row(1, &"x".repeat(1000)));
+        assert!(r.is_accepted());
+    }
+
+    #[test]
+    fn test_backpressure_clears_after_discard() {
+        let mut w = StringWriter::with_limits(100, 100);
+        w.push(row(1, &"x".repeat(80)));
+        w.discard();
+        assert_eq!(w.push(row(2, "fresh")), PushResult::Accepted);
+    }
+
+    #[test]
+    fn test_memory_pressure() {
+        let mut w = StringWriter::with_limits(100, 1000);
+        w.push(row(1, &"x".repeat(60))); // 100 bytes → 10%
+        let p = w.memory_pressure();
+        assert!(p > 0.09 && p < 0.11, "got {:.1}%", p * 100.0);
+    }
+
+    // ── Byte tracking ────────────────────────────────────────────────
+
+    #[test]
+    fn test_bytes_incremental() {
+        let mut w = StringWriter::with_defaults();
+        w.push(row(1, "abc")); // 43
+        w.push(row(2, "defgh")); // 45
+        assert_eq!(w.buffered_bytes(), 43 + 45);
+    }
+
+    #[test]
+    fn test_bytes_reset_on_discard() {
+        let mut w = StringWriter::with_defaults();
+        w.push(row(1, "test"));
+        w.discard();
+        assert_eq!(w.buffered_bytes(), 0);
+    }
+
+    // ── Discard ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_discard() {
+        let mut w = StringWriter::with_defaults();
+        w.push(row(1, "a"));
+        w.push(row(2, "b"));
+        w.discard();
+        assert!(w.is_empty());
+        assert_eq!(w.buffered_bytes(), 0);
+    }
+
+    // ── Statistics ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_avg_value_len() {
+        let mut w = StringWriter::with_defaults();
+        w.total_written = 100;
+        w.total_value_bytes = 5_000;
+        assert_eq!(w.avg_value_len(), 50.0);
+    }
+
+    #[test]
+    fn test_avg_value_len_empty() {
+        assert_eq!(StringWriter::with_defaults().avg_value_len(), 0.0);
+    }
+
+    #[test]
+    fn test_avg_batch_size() {
+        let mut w = StringWriter::with_defaults();
+        w.total_written = 1000;
+        w.total_flushes = 4;
+        assert_eq!(w.avg_batch_size(), 250.0);
+    }
+
+    #[test]
+    fn test_avg_batch_size_empty() {
+        assert_eq!(StringWriter::with_defaults().avg_batch_size(), 0.0);
+    }
+
+    // ── SQL constants ────────────────────────────────────────────────
+
+    #[test]
+    fn test_insert_sql_columns() {
+        let u = INSERT_SQL.to_uppercase();
+        for col in ["TIME", "PV_ID", "VALUE", "SEVERITY", "STATUS"] {
+            assert!(u.contains(col), "missing: {col}");
+        }
+    }
+
+    #[test]
+    fn test_insert_sql_uses_unnest() {
+        assert!(INSERT_SQL.to_uppercase().contains("UNNEST"));
+    }
+
+    #[test]
+    fn test_copy_threshold_sane() {
+        assert!(COPY_THRESHOLD > 0 && COPY_THRESHOLD <= 500);
+    }
+
+    // ── Display / Debug ──────────────────────────────────────────────
+
+    #[test]
+    fn test_display_empty() {
+        let s = StringWriter::with_defaults().to_string();
+        assert!(s.contains("0/500"));
+        assert!(s.contains("0 backpressure"));
+    }
+
+    #[test]
+    fn test_display_with_stats() {
+        let mut w = StringWriter::with_defaults();
+        w.total_written = 200;
+        w.total_value_bytes = 10_000;
+        w.copy_flushes = 2;
+        w.insert_flushes = 2;
+        w.total_backpressure = 1;
+        let s = w.to_string();
+        assert!(s.contains("200 written"));
+        assert!(s.contains("2 COPY"));
+        assert!(s.contains("2 UNNEST"));
+        assert!(s.contains("1 backpressure"));
+    }
+
+    #[test]
+    fn test_debug() {
+        let d = format!("{:?}", StringWriter::with_defaults());
+        assert!(d.contains("StringWriter"));
+        assert!(d.contains("pressure"));
+        assert!(d.contains("backpressure_events"));
+    }
+}
