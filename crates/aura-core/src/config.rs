@@ -36,8 +36,7 @@ impl AuraConfig {
 
     /// Parse configuration from a TOML string.
     pub fn from_str(toml: &str) -> Result<Self, crate::AuraError> {
-        toml::from_str(toml)
-            .map_err(|e| crate::AuraError::config(format!("invalid TOML: {e}")))
+        toml::from_str(toml).map_err(|e| crate::AuraError::config(format!("invalid TOML: {e}")))
     }
 
     /// Validate configuration for logical consistency.
@@ -47,43 +46,44 @@ impl AuraConfig {
 
         if self.discover.liveness_suspect_s >= self.discover.liveness_offline_s {
             issues.push(ConfigIssue::error(
-                "discover", "liveness_suspect_s must be < liveness_offline_s"
+                "discover",
+                "liveness_suspect_s must be < liveness_offline_s",
             ));
         }
 
         if self.filter.calibration_sigma <= 0.0 {
             issues.push(ConfigIssue::error(
-                "filter", "calibration_sigma must be > 0"
+                "filter",
+                "calibration_sigma must be > 0",
             ));
         }
 
         if self.filter.calibration_window < 4 {
             issues.push(ConfigIssue::error(
-                "filter", "calibration_window must be >= 4"
+                "filter",
+                "calibration_window must be >= 4",
             ));
         }
 
         if self.store.batch_size == 0 {
-            issues.push(ConfigIssue::error(
-                "store", "batch_size must be > 0"
-            ));
+            issues.push(ConfigIssue::error("store", "batch_size must be > 0"));
         }
 
         if self.filter.default_epsilon < 0.0 {
-            issues.push(ConfigIssue::error(
-                "filter", "default_epsilon must be >= 0"
-            ));
+            issues.push(ConfigIssue::error("filter", "default_epsilon must be >= 0"));
         }
 
         if self.filter.default_heartbeat_s <= 0.0 {
             issues.push(ConfigIssue::error(
-                "filter", "default_heartbeat_s must be > 0"
+                "filter",
+                "default_heartbeat_s must be > 0",
             ));
         }
 
         if self.ingest.redis_batch_size == 0 {
             issues.push(ConfigIssue::warning(
-                "ingest", "redis_batch_size = 0, every sample will be an individual XADD"
+                "ingest",
+                "redis_batch_size = 0, every sample will be an individual XADD",
             ));
         }
 
@@ -104,11 +104,19 @@ pub struct ConfigIssue {
 
 impl ConfigIssue {
     pub fn error(section: &str, message: &str) -> Self {
-        Self { section: section.into(), message: message.into(), is_error: true }
+        Self {
+            section: section.into(),
+            message: message.into(),
+            is_error: true,
+        }
     }
 
     pub fn warning(section: &str, message: &str) -> Self {
-        Self { section: section.into(), message: message.into(), is_error: false }
+        Self {
+            section: section.into(),
+            message: message.into(),
+            is_error: false,
+        }
     }
 }
 
@@ -159,14 +167,21 @@ pub struct DiscoverConfig {
     /// Seconds without beacon → OFFLINE.
     #[serde(default = "d::liveness_offline")]
     pub liveness_offline_s: u64,
+    /// TCP name servers (IOC addresses) for PV search.
+    #[serde(default)]
+    pub name_servers: Vec<String>,
 }
 
 /// Ingest shard configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct IngestConfig {
-    /// Shard ID for this instance.
+    /// Shard ID for this instance (0-based).
     #[serde(default)]
     pub shard_id: i32,
+    /// Total number of shards. 1 = single instance (all PVs).
+    /// Only set > 1 for horizontal scaling with multiple ingest instances.
+    #[serde(default = "d::total_shards")]
+    pub total_shards: i32,
     /// PVA connection timeout (ms).
     #[serde(default = "d::pva_timeout")]
     pub pva_timeout_ms: u64,
@@ -242,33 +257,82 @@ pub struct TelemetryConfig {
     pub log_format: String,
 }
 
-// ── Defaults (namespaced to avoid pollution) ─────────────────────────
-
 mod d {
-    pub fn redis_url() -> String           { "redis://127.0.0.1:6379".into() }
-    pub fn stream_name() -> String         { "aura:samples".into() }
-    pub fn consumer_group() -> String      { "aura-writers".into() }
-    pub fn max_stream_len() -> u64         { 1_000_000 }
-    pub fn database_url() -> String        { "postgresql://aura:aura@localhost/aura".into() }
-    pub fn max_connections() -> u32        { 20 }
-    pub fn config_poll_interval() -> u64   { 30 }
-    pub fn liveness_suspect() -> u64       { 45 }
-    pub fn liveness_offline() -> u64       { 150 }
-    pub fn pva_timeout() -> u64            { 5000 }
-    pub fn wal_dir() -> String             { "/var/lib/aura/wal".into() }
-    pub fn redis_batch_size() -> usize     { 256 }
-    pub fn redis_flush_interval() -> u64   { 50 }
-    pub fn heartbeat() -> f64              { 60.0 }
-    pub fn auto_calibrate() -> bool        { true }
-    pub fn calibration_window() -> usize   { 128 }
-    pub fn calibration_sigma() -> f64      { 3.0 }
-    pub fn recalibrate_interval() -> u64   { 3600 }
-    pub fn store_batch_size() -> usize     { 500 }
-    pub fn store_flush_interval() -> u64   { 100 }
-    pub fn api_bind() -> String            { "0.0.0.0:8080".into() }
-    pub fn metrics_bind() -> String        { "0.0.0.0:9090".into() }
-    pub fn log_level() -> String           { "info".into() }
-    pub fn log_format() -> String          { "json".into() }
+    pub fn redis_url() -> String {
+        "redis://127.0.0.1:6379".into()
+    }
+    pub fn stream_name() -> String {
+        "aura:samples".into()
+    }
+    pub fn consumer_group() -> String {
+        "aura-writers".into()
+    }
+    pub fn max_stream_len() -> u64 {
+        1_000_000
+    }
+    pub fn database_url() -> String {
+        "postgresql://aura:aura@localhost/aura".into()
+    }
+    pub fn max_connections() -> u32 {
+        20
+    }
+    pub fn config_poll_interval() -> u64 {
+        30
+    }
+    pub fn liveness_suspect() -> u64 {
+        45
+    }
+    pub fn liveness_offline() -> u64 {
+        150
+    }
+    pub fn pva_timeout() -> u64 {
+        5000
+    }
+    pub fn total_shards() -> i32 {
+        1
+    }
+    pub fn wal_dir() -> String {
+        "/var/lib/aura/wal".into()
+    }
+    pub fn redis_batch_size() -> usize {
+        10_000
+    }
+    pub fn redis_flush_interval() -> u64 {
+        50
+    }
+    pub fn heartbeat() -> f64 {
+        60.0
+    }
+    pub fn auto_calibrate() -> bool {
+        true
+    }
+    pub fn calibration_window() -> usize {
+        128
+    }
+    pub fn calibration_sigma() -> f64 {
+        3.0
+    }
+    pub fn recalibrate_interval() -> u64 {
+        3600
+    }
+    pub fn store_batch_size() -> usize {
+        100_000
+    }
+    pub fn store_flush_interval() -> u64 {
+        100
+    }
+    pub fn api_bind() -> String {
+        "0.0.0.0:8080".into()
+    }
+    pub fn metrics_bind() -> String {
+        "0.0.0.0:9090".into()
+    }
+    pub fn log_level() -> String {
+        "info".into()
+    }
+    pub fn log_format() -> String {
+        "json".into()
+    }
 }
 
 #[cfg(test)]
@@ -358,7 +422,7 @@ log_format = "pretty"
         assert_eq!(cfg.ingest.shard_id, 0);
         assert_eq!(cfg.ingest.pva_timeout_ms, 5000);
         assert_eq!(cfg.ingest.wal_dir, "/var/lib/aura/wal");
-        assert_eq!(cfg.ingest.redis_batch_size, 256);
+        assert_eq!(cfg.ingest.redis_batch_size, 10_000);
         assert_eq!(cfg.ingest.redis_flush_interval_ms, 50);
 
         // Filter
@@ -370,7 +434,7 @@ log_format = "pretty"
         assert_eq!(cfg.filter.recalibrate_interval_s, 3600);
 
         // Store
-        assert_eq!(cfg.store.batch_size, 500);
+        assert_eq!(cfg.store.batch_size, 100_000);
         assert_eq!(cfg.store.flush_interval_ms, 100);
 
         // API
@@ -442,11 +506,9 @@ url = "redis://custom:6379"
 "#;
         let cfg = AuraConfig::from_str(toml).unwrap();
         assert_eq!(cfg.redis.url, "redis://custom:6379");
-        assert_eq!(cfg.redis.stream, "aura:samples"); // default kept
-        assert_eq!(cfg.redis.max_stream_len, 1_000_000); // default kept
+        assert_eq!(cfg.redis.stream, "aura:samples");
+        assert_eq!(cfg.redis.max_stream_len, 1_000_000);
     }
-
-    // ── Error handling ───────────────────────────────────────────────
 
     #[test]
     fn test_invalid_toml() {
@@ -460,30 +522,37 @@ url = "redis://custom:6379"
     fn test_missing_file() {
         let result = AuraConfig::from_file("/nonexistent/aura.toml");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cannot read config"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("cannot read config")
+        );
     }
 
     #[test]
     fn test_missing_section() {
         let result = AuraConfig::from_str("[redis]\n");
-        assert!(result.is_err()); // missing required sections
+        assert!(result.is_err());
     }
-
-    // ── Validation ───────────────────────────────────────────────────
 
     #[test]
     fn test_validate_default_config_passes() {
         let cfg = AuraConfig::from_str(MINIMAL_TOML).unwrap();
         let issues = cfg.validate();
         let errors: Vec<_> = issues.iter().filter(|i| i.is_error).collect();
-        assert!(errors.is_empty(), "default config should have no errors: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "default config should have no errors: {:?}",
+            errors
+        );
     }
 
     #[test]
     fn test_validate_liveness_order() {
         let mut cfg = AuraConfig::from_str(MINIMAL_TOML).unwrap();
         cfg.discover.liveness_suspect_s = 200;
-        cfg.discover.liveness_offline_s = 100; // suspect > offline → error
+        cfg.discover.liveness_offline_s = 100;
         let issues = cfg.validate();
         assert!(issues.iter().any(|i| i.is_error && i.section == "discover"));
     }
@@ -493,7 +562,11 @@ url = "redis://custom:6379"
         let mut cfg = AuraConfig::from_str(MINIMAL_TOML).unwrap();
         cfg.filter.calibration_sigma = -1.0;
         let issues = cfg.validate();
-        assert!(issues.iter().any(|i| i.is_error && i.message.contains("sigma")));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.is_error && i.message.contains("sigma"))
+        );
     }
 
     #[test]
@@ -501,7 +574,11 @@ url = "redis://custom:6379"
         let mut cfg = AuraConfig::from_str(MINIMAL_TOML).unwrap();
         cfg.filter.calibration_window = 2;
         let issues = cfg.validate();
-        assert!(issues.iter().any(|i| i.is_error && i.message.contains("window")));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.is_error && i.message.contains("window"))
+        );
     }
 
     #[test]
@@ -509,7 +586,11 @@ url = "redis://custom:6379"
         let mut cfg = AuraConfig::from_str(MINIMAL_TOML).unwrap();
         cfg.store.batch_size = 0;
         let issues = cfg.validate();
-        assert!(issues.iter().any(|i| i.is_error && i.message.contains("batch_size")));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.is_error && i.message.contains("batch_size"))
+        );
     }
 
     #[test]
@@ -517,7 +598,11 @@ url = "redis://custom:6379"
         let mut cfg = AuraConfig::from_str(MINIMAL_TOML).unwrap();
         cfg.filter.default_epsilon = -0.5;
         let issues = cfg.validate();
-        assert!(issues.iter().any(|i| i.is_error && i.message.contains("epsilon")));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.is_error && i.message.contains("epsilon"))
+        );
     }
 
     #[test]
@@ -525,7 +610,11 @@ url = "redis://custom:6379"
         let mut cfg = AuraConfig::from_str(MINIMAL_TOML).unwrap();
         cfg.filter.default_heartbeat_s = 0.0;
         let issues = cfg.validate();
-        assert!(issues.iter().any(|i| i.is_error && i.message.contains("heartbeat")));
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.is_error && i.message.contains("heartbeat"))
+        );
     }
 
     #[test]
@@ -536,8 +625,6 @@ url = "redis://custom:6379"
         let warnings: Vec<_> = issues.iter().filter(|i| !i.is_error).collect();
         assert!(!warnings.is_empty());
     }
-
-    // ── Serde roundtrip ──────────────────────────────────────────────
 
     #[test]
     fn test_serde_roundtrip() {
@@ -555,8 +642,6 @@ url = "redis://custom:6379"
         assert_eq!(cfg, back);
     }
 
-    // ── ConfigIssue ──────────────────────────────────────────────────
-
     #[test]
     fn test_config_issue_display_error() {
         let issue = ConfigIssue::error("filter", "bad sigma");
@@ -571,8 +656,6 @@ url = "redis://custom:6379"
         assert!(!issue.is_error);
     }
 
-    // ── Clone / PartialEq ────────────────────────────────────────────
-
     #[test]
     fn test_clone_eq() {
         let a = AuraConfig::from_str(MINIMAL_TOML).unwrap();
@@ -586,8 +669,6 @@ url = "redis://custom:6379"
         let b = AuraConfig::from_str(FULL_TOML).unwrap();
         assert_ne!(a, b);
     }
-
-    // ── Debug ────────────────────────────────────────────────────────
 
     #[test]
     fn test_debug() {
