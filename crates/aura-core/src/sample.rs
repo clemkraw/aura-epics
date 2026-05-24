@@ -1,11 +1,11 @@
 //! Every piece of data flowing through AURA's pipeline is a [`PvUpdate`]:
-//! `IOC (PVA monitor) → aura-ingest (filter) → Redis → aura-store → TimescaleDB`
 //!
 //! The update wraps a full PVAccess Normative Type.
 //! This preserves the complete EPICS semantics (alarm, timestamp, metadata) through the entire pipeline.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::pva::{Alarm, NormativeType, PvDataType};
 
@@ -14,17 +14,14 @@ use crate::pva::{Alarm, NormativeType, PvDataType};
 /// This is the atomic unit flowing through AURA's pipeline.
 /// It wraps the full PVA Normative Type with routing metadata.
 ///
-/// The `pv_id` field is resolved lazily: `None` when received from
-/// the network, populated by `aura-store` via the `pv_lookup` table just before database insertion.
+/// The PV name is allocated once at registration time and shared via atomic reference counting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PvUpdate {
     /// PV name as published by the IOC (e.g., "CRYO:SECT2:TEMP:READ").
-    pub pv_name: String,
-
+    pub pv_name: Arc<str>,
     /// Numeric PV ID from `pv_lookup`. `None` until resolved by aura-store.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pv_id: Option<i32>,
-
     /// The full Normative Type payload from the PVA monitor.
     pub data: NormativeType,
 }
@@ -32,7 +29,7 @@ pub struct PvUpdate {
 impl PvUpdate {
     /// Create a new update (pv_id unresolved).
     #[inline]
-    pub fn new(pv_name: impl Into<String>, data: NormativeType) -> Self {
+    pub fn new(pv_name: impl Into<Arc<str>>, data: NormativeType) -> Self {
         Self {
             pv_name: pv_name.into(),
             pv_id: None,
@@ -42,7 +39,7 @@ impl PvUpdate {
 
     /// Create a new update with a pre-resolved pv_id.
     #[inline]
-    pub fn with_id(pv_name: impl Into<String>, pv_id: i32, data: NormativeType) -> Self {
+    pub fn with_id(pv_name: impl Into<Arc<str>>, pv_id: i32, data: NormativeType) -> Self {
         Self {
             pv_name: pv_name.into(),
             pv_id: Some(pv_id),
@@ -129,8 +126,7 @@ impl fmt::Display for PvUpdate {
 /// Reason why a sample was stored (for metrics, debugging, and auditing).
 ///
 /// Every stored sample is tagged with the reason it passed the filter.
-/// This is exposed in Prometheus metrics (`aura_samples_stored_total{reason="..."}`)
-/// and available via the API for diagnostics.
+/// This is exposed in Prometheus metrics (`aura_samples_stored_total{reason="..."}`) and available via the API for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StoreReason {
     /// Value exceeded the epsilon-deadband threshold.
@@ -158,10 +154,16 @@ pub enum StoreReason {
 impl StoreReason {
     /// All possible store reasons.
     pub const ALL: [Self; 10] = [
-        Self::EpsilonExceeded, Self::Heartbeat, Self::Initial,
-        Self::Disconnected, Self::Reconnected, Self::AlarmChange,
-        Self::ArrayChanged, Self::TableChanged,
-        Self::ImageFrame, Self::CustomChanged,
+        Self::EpsilonExceeded,
+        Self::Heartbeat,
+        Self::Initial,
+        Self::Disconnected,
+        Self::Reconnected,
+        Self::AlarmChange,
+        Self::ArrayChanged,
+        Self::TableChanged,
+        Self::ImageFrame,
+        Self::CustomChanged,
     ];
 
     /// Whether this reason indicates a connectivity event (not a value change).
@@ -173,8 +175,14 @@ impl StoreReason {
     /// Whether this reason indicates a value-driven store.
     #[inline]
     pub fn is_value_change(&self) -> bool {
-        matches!(self, Self::EpsilonExceeded | Self::ArrayChanged
-            | Self::TableChanged | Self::ImageFrame | Self::CustomChanged)
+        matches!(
+            self,
+            Self::EpsilonExceeded
+                | Self::ArrayChanged
+                | Self::TableChanged
+                | Self::ImageFrame
+                | Self::CustomChanged
+        )
     }
 }
 
@@ -182,15 +190,15 @@ impl fmt::Display for StoreReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::EpsilonExceeded => "epsilon",
-            Self::Heartbeat       => "heartbeat",
-            Self::Initial         => "initial",
-            Self::Disconnected    => "disconnected",
-            Self::Reconnected     => "reconnected",
-            Self::AlarmChange     => "alarm_change",
-            Self::ArrayChanged    => "array_changed",
-            Self::TableChanged    => "table_changed",
-            Self::ImageFrame      => "image_frame",
-            Self::CustomChanged   => "custom_changed",
+            Self::Heartbeat => "heartbeat",
+            Self::Initial => "initial",
+            Self::Disconnected => "disconnected",
+            Self::Reconnected => "reconnected",
+            Self::AlarmChange => "alarm_change",
+            Self::ArrayChanged => "array_changed",
+            Self::TableChanged => "table_changed",
+            Self::ImageFrame => "image_frame",
+            Self::CustomChanged => "custom_changed",
         })
     }
 }
@@ -245,48 +253,63 @@ mod tests {
     use super::*;
     use crate::pva::*;
 
-    fn ts() -> TimeStamp { TimeStamp::new(1713520000, 0) }
+    fn ts() -> TimeStamp {
+        TimeStamp::new(1713520000, 0)
+    }
 
     fn scalar_update(value: f64) -> PvUpdate {
-        PvUpdate::new("CRYO:TEMP", NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Double(value),
-            alarm: Alarm::default(),
-            timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }))
+        PvUpdate::new(
+            "CRYO:TEMP",
+            NormativeType::NTScalar(NTScalar {
+                value: ScalarValue::Double(value),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        )
     }
 
     fn alarm_update(sev: AlarmSeverity) -> PvUpdate {
-        PvUpdate::new("MAG:I", NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Double(802.3),
-            alarm: Alarm::new(sev, AlarmStatus::Device, "test"),
-            timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }))
+        PvUpdate::new(
+            "MAG:I",
+            NormativeType::NTScalar(NTScalar {
+                value: ScalarValue::Double(802.3),
+                alarm: Alarm::new(sev, AlarmStatus::Device, "test"),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        )
     }
-
-    // ── Construction ─────────────────────────────────────────────────
 
     #[test]
     fn test_new() {
         let u = scalar_update(4.217);
-        assert_eq!(u.pv_name, "CRYO:TEMP");
+        assert_eq!(&*u.pv_name, "CRYO:TEMP");
         assert!(u.pv_id.is_none());
         assert!(!u.is_resolved());
     }
 
     #[test]
     fn test_with_id() {
-        let u = PvUpdate::with_id("PV", 42, NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Int(0),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let u = PvUpdate::with_id(
+            "PV",
+            42,
+            NormativeType::NTScalar(NTScalar {
+                value: ScalarValue::Int(0),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         assert_eq!(u.pv_id, Some(42));
         assert!(u.is_resolved());
     }
-
-    // ── as_f64 for each NT type ──────────────────────────────────────
 
     #[test]
     fn test_as_f64_scalar_double() {
@@ -295,82 +318,124 @@ mod tests {
 
     #[test]
     fn test_as_f64_scalar_int() {
-        let u = PvUpdate::new("PV", NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Int(-42),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTScalar(NTScalar {
+                value: ScalarValue::Int(-42),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         assert_eq!(u.as_f64(), Some(-42.0));
     }
 
     #[test]
     fn test_as_f64_scalar_string_none() {
-        let u = PvUpdate::new("PV", NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::String("hello".into()),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTScalar(NTScalar {
+                value: ScalarValue::String("hello".into()),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         assert_eq!(u.as_f64(), None);
     }
 
     #[test]
     fn test_as_f64_enum() {
-        let u = PvUpdate::new("PV", NormativeType::NTEnum(NTEnum {
-            value: EnumValue::from_strs(2, &["A", "B", "C"]),
-            alarm: Alarm::default(), timestamp: ts(),
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTEnum(NTEnum {
+                value: EnumValue::from_strs(2, &["A", "B", "C"]),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+        );
         assert_eq!(u.as_f64(), Some(2.0));
     }
 
     #[test]
     fn test_as_f64_aggregate() {
-        let u = PvUpdate::new("PV", NormativeType::NTAggregate(NTAggregate {
-            value: 99.9, n: 1, dispersion: 0.0,
-            first: 99.9, last: 99.9, max: 99.9, min: 99.9,
-            alarm: Alarm::default(), timestamp: ts(),
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTAggregate(NTAggregate {
+                value: 99.9,
+                n: 1,
+                dispersion: 0.0,
+                first: 99.9,
+                last: 99.9,
+                max: 99.9,
+                min: 99.9,
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+        );
         assert_eq!(u.as_f64(), Some(99.9));
     }
 
     #[test]
     fn test_as_f64_union_scalar() {
-        let u = PvUpdate::new("PV", NormativeType::NTUnion(NTUnion {
-            value: UnionValue::Scalar(ScalarValue::Double(7.0)),
-            descriptor: String::new(),
-            alarm: Alarm::default(), timestamp: ts(),
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTUnion(NTUnion {
+                value: UnionValue::Scalar(ScalarValue::Double(7.0)),
+                descriptor: String::new(),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+        );
         assert_eq!(u.as_f64(), Some(7.0));
     }
 
     #[test]
     fn test_as_f64_array_none() {
-        let u = PvUpdate::new("PV", NormativeType::NTScalarArray(NTScalarArray {
-            value: ArrayValue::DoubleArray(vec![1.0]),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTScalarArray(NTScalarArray {
+                value: ArrayValue::DoubleArray(vec![1.0]),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         assert_eq!(u.as_f64(), None);
     }
 
     #[test]
     fn test_as_f64_table_none() {
-        let u = PvUpdate::new("PV", NormativeType::NTTable(NTTable {
-            labels: vec![], columns: vec![],
-            alarm: Alarm::default(), timestamp: ts(),
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTTable(NTTable {
+                labels: vec![],
+                columns: vec![],
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+        );
         assert_eq!(u.as_f64(), None);
     }
 
     #[test]
     fn test_as_f64_custom_none() {
-        let u = PvUpdate::new("PV", NormativeType::Custom(CustomStructure {
-            data: serde_json::json!({}),
-            alarm: Alarm::default(), timestamp: ts(),
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::Custom(CustomStructure {
+                data: serde_json::json!({}),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+        );
         assert_eq!(u.as_f64(), None);
     }
-
-    // ── data_type routing ────────────────────────────────────────────
 
     #[test]
     fn test_data_type_scalar() {
@@ -379,51 +444,73 @@ mod tests {
 
     #[test]
     fn test_data_type_string() {
-        let u = PvUpdate::new("PV", NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::String("x".into()),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTScalar(NTScalar {
+                value: ScalarValue::String("x".into()),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         assert_eq!(u.data_type(), PvDataType::String);
     }
 
     #[test]
     fn test_data_type_array() {
-        let u = PvUpdate::new("PV", NormativeType::NTScalarArray(NTScalarArray {
-            value: ArrayValue::DoubleArray(vec![]),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTScalarArray(NTScalarArray {
+                value: ArrayValue::DoubleArray(vec![]),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         assert_eq!(u.data_type(), PvDataType::Array);
     }
 
     #[test]
     fn test_data_type_image() {
-        let u = PvUpdate::new("PV", NormativeType::NTNDArray(NTNDArray {
-            value: ArrayValue::UByteArray(vec![]),
-            codec: Codec::default(),
-            compressed_size: 0, uncompressed_size: 0,
-            dimension: vec![], unique_id: 0, data_timestamp: None,
-            alarm: Alarm::default(), timestamp: ts(), attribute: vec![],
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTNDArray(NTNDArray {
+                value: ArrayValue::UByteArray(vec![]),
+                codec: Codec::default(),
+                compressed_size: 0,
+                uncompressed_size: 0,
+                dimension: vec![],
+                unique_id: 0,
+                data_timestamp: None,
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                attribute: vec![],
+            }),
+        );
         assert_eq!(u.data_type(), PvDataType::Image);
     }
-
-    // ── is_scalar_filterable ─────────────────────────────────────────
 
     #[test]
     fn test_is_scalar_filterable() {
         assert!(scalar_update(0.0).is_scalar_filterable());
 
-        let arr = PvUpdate::new("PV", NormativeType::NTScalarArray(NTScalarArray {
-            value: ArrayValue::DoubleArray(vec![]),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let arr = PvUpdate::new(
+            "PV",
+            NormativeType::NTScalarArray(NTScalarArray {
+                value: ArrayValue::DoubleArray(vec![]),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         assert!(!arr.is_scalar_filterable());
     }
-
-    // ── Alarm accessors ──────────────────────────────────────────────
 
     #[test]
     fn test_alarm_no_alarm() {
@@ -463,8 +550,6 @@ mod tests {
         assert_eq!(alarm.message, "test");
     }
 
-    // ── Timestamp ────────────────────────────────────────────────────
-
     #[test]
     fn test_timestamp() {
         let u = scalar_update(0.0);
@@ -472,20 +557,20 @@ mod tests {
         assert_eq!(dt.timestamp(), 1713520000);
     }
 
-    // ── type_name ────────────────────────────────────────────────────
-
     #[test]
     fn test_type_name() {
         assert_eq!(scalar_update(0.0).type_name(), "NTScalar");
 
-        let u = PvUpdate::new("PV", NormativeType::NTEnum(NTEnum {
-            value: EnumValue::from_strs(0, &["A"]),
-            alarm: Alarm::default(), timestamp: ts(),
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTEnum(NTEnum {
+                value: EnumValue::from_strs(0, &["A"]),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+        );
         assert_eq!(u.type_name(), "NTEnum");
     }
-
-    // ── Display ──────────────────────────────────────────────────────
 
     #[test]
     fn test_display_scalar() {
@@ -503,16 +588,20 @@ mod tests {
 
     #[test]
     fn test_display_array_no_value() {
-        let u = PvUpdate::new("PV", NormativeType::NTScalarArray(NTScalarArray {
-            value: ArrayValue::DoubleArray(vec![1.0]),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let u = PvUpdate::new(
+            "PV",
+            NormativeType::NTScalarArray(NTScalarArray {
+                value: ArrayValue::DoubleArray(vec![1.0]),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         let s = u.to_string();
         assert_eq!(s, "PV:NTScalarArray"); // no =value for arrays
     }
-
-    // ── Clone / PartialEq ────────────────────────────────────────────
 
     #[test]
     fn test_clone_eq() {
@@ -527,8 +616,6 @@ mod tests {
         let b = scalar_update(4.3);
         assert_ne!(a, b);
     }
-
-    // ── Serde ────────────────────────────────────────────────────────
 
     #[test]
     fn test_serde_roundtrip() {
@@ -548,11 +635,18 @@ mod tests {
 
     #[test]
     fn test_serde_includes_pv_id() {
-        let u = PvUpdate::with_id("PV", 7, NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Int(0),
-            alarm: Alarm::default(), timestamp: ts(),
-            display: None, control: None, value_alarm: None,
-        }));
+        let u = PvUpdate::with_id(
+            "PV",
+            7,
+            NormativeType::NTScalar(NTScalar {
+                value: ScalarValue::Int(0),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+        );
         let json = serde_json::to_string(&u).unwrap();
         assert!(json.contains(r#""pv_id":7"#));
     }
@@ -624,7 +718,10 @@ mod tests {
 
     #[test]
     fn test_filter_decision_display() {
-        assert_eq!(FilterDecision::Store(StoreReason::Heartbeat).to_string(), "STORE(heartbeat)");
+        assert_eq!(
+            FilterDecision::Store(StoreReason::Heartbeat).to_string(),
+            "STORE(heartbeat)"
+        );
         assert_eq!(FilterDecision::Drop.to_string(), "DROP");
     }
 
