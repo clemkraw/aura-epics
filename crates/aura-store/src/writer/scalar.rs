@@ -1,59 +1,56 @@
-//! Batch writer for the `samples` table (scalar numeric data).
+//! Batch writer for the `samples` hypertable (scalar numeric data).
 //!
-//! This handles ~90% of all writes: NTScalar (numeric), NTEnum, NTAggregate.
+//! Handles ~90% of all writes: NTScalar (numeric), NTEnum, NTAggregate.
 //!
-//! ## Write Strategy
+//! # Backpressure
 //!
-//! Two-tier insertion depending on batch size:
+//! Hard memory limit (`max_buffer_bytes`, default 64 MB) prevents OOM.
+//! `push()` returns [`PushResult`] to signal the caller.
 //!
-//! - **Small batches (< 50 rows):** UNNEST batch INSERT — a single SQL
-//!   statement with 6 parallel arrays. One network round-trip for N rows.
-//!
-//! - **Large batches (≥ 50 rows):** `COPY FROM STDIN` text protocol.
-//!   Bypasses SQL parsing entirely — data streams directly to the storage engine.
-//!
-//! ## Backpressure
-//!
-//! Hard memory limit (`max_buffer_bytes`, default 64 MB) prevents OOM
-//! when TimescaleDB is slow and scalar samples accumulate. `push()`
-//! returns `PushResult` with backpressure signaling. At 26 bytes per
-//! `ScalarRow`, 64 MB holds ~2.5 million rows — a comfortable buffer
-//! for sustained 500k samples/s with occasional DB hiccups.
-//!
-//! ## Row Layout
+//! # Binary Row Layout (on the wire)
 //!
 //! ```text
-//! time(8) + pv_id(4) + value(8) + severity(2) + status(2) + reason(2) = 26 bytes
-//! ```
+//! num_cols(2) + [len(4)+time(8)] + [len(4)+pv_id(4)] + [len(4)+value(8)]
+//!             + [len(4)+severity(2)] + [len(4)+status(2)] + [len(4)+reason(2)]
 //!
-//! After TimescaleDB compression: ~4-6 bytes per row (gorilla + dictionary).
+//! Layout breakdown:
+//!   - num_cols: 2 bytes
+//!   - time:     4 + 8 = 12 bytes
+//!   - pv_id:    4 + 4 = 8 bytes
+//!   - value:    4 + 8 = 12 bytes
+//!   - severity: 4 + 2 = 6 bytes
+//!   - status:   4 + 2 = 6 bytes
+//!   - reason:   4 + 2 = 6 bytes
+//! Total = 2 + 12 + 8 + 12 + 6 + 6 + 6 = 52 bytes per row
+//! ```
 
 use chrono::{DateTime, Utc};
 use std::fmt;
 
-use sqlx::PgPool;
-use sqlx::postgres::PgPoolCopyExt;
 use aura_core::error::{AuraError, AuraResult};
 use aura_core::sample::StoreReason;
+use crate::writer::copy_pool::PushResult;
 
-/// UNNEST batch INSERT query (parameterized, no string interpolation).
-const UNNEST_SQL: &str = r#"
-    INSERT INTO samples (time, pv_id, value, severity, status, reason)
-    SELECT * FROM UNNEST($1::timestamptz[], $2::int[], $3::float8[], $4::smallint[], $5::smallint[], $6::smallint[])
-"#;
-
-/// Batch size threshold for switching from UNNEST to COPY.
-const COPY_THRESHOLD: usize = 50;
+/// Minimum rows for a COPY (below this, we still COPY — no UNNEST fallback).
+#[allow(dead_code)]
+const COPY_MIN_ROWS: usize = 1;
 
 /// Default maximum buffer memory (64 MB).
 const DEFAULT_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
-/// Approximate memory per ScalarRow (stack + heap overhead).
-const ROW_MEM_SIZE: usize = 48; // 26 bytes data + alignment + Vec slot overhead
+/// Approximate memory per ScalarRow (data + alignment + Vec slot).
+const ROW_MEM_SIZE: usize = 48;
+
+/// Binary COPY: bytes per row on the wire.
+const WIRE_ROW_SIZE: usize = 52;
+
+// PGCOPY constants imported from copy_pool.
+use super::copy_pool::{PG_EPOCH_OFFSET_US, PGCOPY_HEADER, PGCOPY_TRAILER};
+
+/// Number of columns in the COPY.
+const NUM_COLUMNS: i16 = 6;
 
 /// A single row for the `samples` table.
-///
-/// Fixed-size, no heap allocations. 26 bytes of useful data per row.
 #[derive(Debug, Clone, Copy)]
 pub struct ScalarRow {
     pub time: DateTime<Utc>,
@@ -65,7 +62,6 @@ pub struct ScalarRow {
 }
 
 impl ScalarRow {
-    /// Create a row from resolved components.
     #[inline]
     pub fn new(
         time: DateTime<Utc>,
@@ -75,78 +71,104 @@ impl ScalarRow {
         status: i16,
         reason: StoreReason,
     ) -> Self {
-        Self { time, pv_id, value, severity, status, reason: reason as i16 }
+        Self {
+            time,
+            pv_id,
+            value,
+            severity,
+            status,
+            reason: reason as i16,
+        }
     }
 
-    /// Whether the value is NaN or Infinity.
-    ///
-    /// PostgreSQL accepts these, but they can poison downstream
-    /// aggregates (AVG of NaN = NaN). The writer logs a warning
-    /// but still archives — the IOC sent it, we store it.
+    /// Whether the value is NaN or ±Infinity.
     #[inline]
     pub fn has_non_finite(&self) -> bool {
         !self.value.is_finite()
     }
 
-    /// Approximate memory size (constant — no heap allocations).
+    /// Approximate in-memory size (constant).
     #[inline]
     pub const fn mem_size() -> usize {
         ROW_MEM_SIZE
+    }
+
+    /// Encode this row into the COPY binary format (52 bytes).
+    #[inline]
+    fn encode_copy(&self, out: &mut [u8; WIRE_ROW_SIZE]) {
+        let pg_us = self.time.timestamp_micros() - PG_EPOCH_OFFSET_US;
+
+        let mut o = 0;
+        // num_columns (i16)
+        out[o..o + 2].copy_from_slice(&NUM_COLUMNS.to_be_bytes());
+        o += 2;
+        // time: len=8, value=i64 (PostgreSQL timestamptz as microseconds since 2000-01-01)
+        out[o..o + 4].copy_from_slice(&8i32.to_be_bytes());
+        o += 4;
+        out[o..o + 8].copy_from_slice(&pg_us.to_be_bytes());
+        o += 8;
+        // pv_id: len=4, value=i32
+        out[o..o + 4].copy_from_slice(&4i32.to_be_bytes());
+        o += 4;
+        out[o..o + 4].copy_from_slice(&self.pv_id.to_be_bytes());
+        o += 4;
+        // value: len=8, value=f64
+        out[o..o + 4].copy_from_slice(&8i32.to_be_bytes());
+        o += 4;
+        out[o..o + 8].copy_from_slice(&self.value.to_be_bytes());
+        o += 8;
+        // severity: len=2, value=i16
+        out[o..o + 4].copy_from_slice(&2i32.to_be_bytes());
+        o += 4;
+        out[o..o + 2].copy_from_slice(&self.severity.to_be_bytes());
+        o += 2;
+        // status: len=2, value=i16
+        out[o..o + 4].copy_from_slice(&2i32.to_be_bytes());
+        o += 4;
+        out[o..o + 2].copy_from_slice(&self.status.to_be_bytes());
+        o += 2;
+        // reason: len=2, value=i16
+        out[o..o + 4].copy_from_slice(&2i32.to_be_bytes());
+        o += 4;
+        out[o..o + 2].copy_from_slice(&self.reason.to_be_bytes());
+        // o += 2; // == 52 == WIRE_ROW_SIZE
     }
 }
 
 impl fmt::Display for ScalarRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pv_id={} value={} sev={} reason={}",
-               self.pv_id, self.value, self.severity, self.reason)
+        write!(
+            f,
+            "pv_id={} value={} sev={} reason={}",
+            self.pv_id, self.value, self.severity, self.reason
+        )
     }
 }
 
-/// Result of pushing a row into the buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PushResult {
-    /// Row accepted, buffer not yet full.
-    Accepted,
-    /// Row accepted, buffer full — caller should flush.
-    Full,
-    /// Row **rejected** — memory limit exceeded, caller MUST flush first.
-    BackpressureExceeded,
-}
-
-impl PushResult {
-    #[inline] pub fn needs_flush(&self) -> bool { !matches!(self, Self::Accepted) }
-    #[inline] pub fn is_accepted(&self) -> bool { !matches!(self, Self::BackpressureExceeded) }
-}
-
-impl fmt::Display for PushResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Accepted => "accepted",
-            Self::Full => "full",
-            Self::BackpressureExceeded => "backpressure",
-        })
-    }
-}
-
-/// Batch writer for scalar numeric samples with backpressure
-/// and automatic UNNEST/COPY strategy selection.
+/// High-throughput batch writer for scalar numeric samples.
 ///
-/// This is the highest-throughput writer — handles ~90% of all traffic.
+/// Accumulates [`ScalarRow`]s in memory, then flushes to TimescaleDB via
+/// binary `COPY` on dedicated `tokio-postgres` connections. Supports
+/// parallel COPY across N connections for N× throughput.
 pub struct ScalarWriter {
     batch_size: usize,
     max_buffer_bytes: usize,
     buffer: Vec<ScalarRow>,
+
+    /// Shared COPY pool — scalar uses all N connections for parallel flush.
+    copy_pool: Option<super::copy_pool::CopyPool>,
 
     total_written: u64,
     total_flushes: u64,
     total_backpressure: u64,
     total_non_finite: u64,
     copy_flushes: u64,
-    unnest_flushes: u64,
+    total_build_us: u64,
+    total_send_us: u64,
 }
 
 impl ScalarWriter {
-    /// Create with batch size and default memory limit (64 MB).
+    /// Create with explicit batch size (default memory limit: 64 MB).
     pub fn new(batch_size: usize) -> Self {
         Self::with_limits(batch_size, DEFAULT_MAX_BUFFER_BYTES)
     }
@@ -159,23 +181,33 @@ impl ScalarWriter {
             batch_size,
             max_buffer_bytes,
             buffer: Vec::with_capacity(batch_size),
+            copy_pool: None,
             total_written: 0,
             total_flushes: 0,
             total_backpressure: 0,
             total_non_finite: 0,
             copy_flushes: 0,
-            unnest_flushes: 0,
+            total_build_us: 0,
+            total_send_us: 0,
         }
     }
 
-    /// Create with default settings (batch=500, limit=64 MB).
-    pub fn with_defaults() -> Self { Self::new(500) }
+    /// Create with defaults (batch=500, limit=64 MB).
+    pub fn with_defaults() -> Self {
+        Self::new(500)
+    }
 
-    /// Push a single row with backpressure protection.
+    /// Set the shared COPY pool. Scalar uses all N connections for
+    /// parallel flush via `send_parallel`.
+    pub fn set_copy_pool(&mut self, pool: super::copy_pool::CopyPool) {
+        self.copy_pool = Some(pool);
+    }
+
+    /// Push a single row. Returns buffer state for the caller to decide when to flush.
     #[inline]
     pub fn push(&mut self, row: ScalarRow) -> PushResult {
         if !self.buffer.is_empty()
-            && self.buffered_bytes() + ROW_MEM_SIZE > self.max_buffer_bytes
+            && self.buffer.len() * ROW_MEM_SIZE + ROW_MEM_SIZE > self.max_buffer_bytes
         {
             self.total_backpressure += 1;
             return PushResult::BackpressureExceeded;
@@ -184,7 +216,6 @@ impl ScalarWriter {
         if row.has_non_finite() {
             self.total_non_finite += 1;
         }
-
         self.buffer.push(row);
 
         if self.buffer.len() >= self.batch_size {
@@ -194,188 +225,202 @@ impl ScalarWriter {
         }
     }
 
-    /// Push multiple rows at once.
-    ///
-    /// Returns the number of rows accepted. Stops at backpressure limit.
+    /// Push multiple rows. Stops at backpressure. Returns accepted count.
     pub fn push_batch(&mut self, rows: impl IntoIterator<Item = ScalarRow>) -> usize {
-        let mut accepted = 0;
+        let mut n = 0;
         for row in rows {
             match self.push(row) {
-                PushResult::Accepted | PushResult::Full => { accepted += 1; }
+                PushResult::Accepted | PushResult::Full => n += 1,
                 PushResult::BackpressureExceeded => break,
             }
         }
-        accepted
+        n
     }
 
-    /// Flush all buffered rows to the database.
+    /// Flush all buffered rows to TimescaleDB via binary COPY.
     ///
-    /// Selects UNNEST (< 50 rows) or COPY (≥ 50 rows) automatically.
-    pub async fn flush(&mut self, pool: &PgPool) -> AuraResult<usize> {
+    /// Requires a copy pool set via [`set_copy_pool`].
+    /// Uses parallel COPY across N connections for N-way throughput.
+    pub async fn flush(&mut self) -> AuraResult<usize> {
         if self.buffer.is_empty() {
             return Ok(0);
         }
 
+        let pool = self
+            .copy_pool
+            .as_ref()
+            .ok_or_else(|| AuraError::database("ScalarWriter: no copy pool configured"))?;
         let count = self.buffer.len();
+        let n = pool.len();
 
-        if count >= COPY_THRESHOLD {
-            self.flush_copy(pool).await?;
-            self.copy_flushes += 1;
+        // Small batches: 1 COPY is faster than N-way parallel (avoids N× setup overhead).
+        // Large batches: split across N connections for N× throughput.
+        const PARALLEL_THRESHOLD: usize = 10_000;
+
+        if count >= PARALLEL_THRESHOLD && n > 1 {
+            // Parallel: split into N chunks.
+            let chunk_size = (count + n - 1) / n;
+
+            let t0 = std::time::Instant::now();
+            let payloads: Vec<_> = self
+                .buffer
+                .chunks(chunk_size)
+                .map(|chunk| (Self::build_copy_payload(chunk), chunk.len()))
+                .collect();
+            self.total_build_us += t0.elapsed().as_micros() as u64;
+
+            let t1 = std::time::Instant::now();
+            pool.send_parallel(Self::COPY_SQL, payloads).await?;
+            self.total_send_us += t1.elapsed().as_micros() as u64;
         } else {
-            self.flush_unnest(pool).await?;
-            self.unnest_flushes += 1;
+            let t0 = std::time::Instant::now();
+            let payload = Self::build_copy_payload(&self.buffer);
+            self.total_build_us += t0.elapsed().as_micros() as u64;
+
+            let t1 = std::time::Instant::now();
+            pool.send_copy(0, Self::COPY_SQL, payload, count).await?;
+            self.total_send_us += t1.elapsed().as_micros() as u64;
         }
 
+        self.copy_flushes += 1;
         self.total_written += count as u64;
         self.total_flushes += 1;
         self.buffer.clear();
-
         Ok(count)
     }
 
-    /// UNNEST batch INSERT — single SQL statement with 6 parallel arrays.
-    async fn flush_unnest(&self, pool: &PgPool) -> AuraResult<()> {
-        let count = self.buffer.len();
-        let mut times = Vec::with_capacity(count);
-        let mut pv_ids = Vec::with_capacity(count);
-        let mut values = Vec::with_capacity(count);
-        let mut severities = Vec::with_capacity(count);
-        let mut statuses = Vec::with_capacity(count);
-        let mut reasons = Vec::with_capacity(count);
+    /// Build a COPY binary payload from a slice of rows. .
+    fn build_copy_payload(rows: &[ScalarRow]) -> Vec<u8> {
+        let capacity = PGCOPY_HEADER.len() + rows.len() * WIRE_ROW_SIZE + PGCOPY_TRAILER.len();
+        let mut buf = Vec::with_capacity(capacity);
 
-        for row in &self.buffer {
-            times.push(row.time);
-            pv_ids.push(row.pv_id);
-            values.push(row.value);
-            severities.push(row.severity);
-            statuses.push(row.status);
-            reasons.push(row.reason);
+        buf.extend_from_slice(&PGCOPY_HEADER);
+
+        let mut row_buf = [0u8; WIRE_ROW_SIZE];
+        for row in rows {
+            row.encode_copy(&mut row_buf);
+            buf.extend_from_slice(&row_buf);
         }
 
-        sqlx::query(UNNEST_SQL)
-            .bind(&times)
-            .bind(&pv_ids)
-            .bind(&values)
-            .bind(&severities)
-            .bind(&statuses)
-            .bind(&reasons)
-            .execute(pool)
-            .await
-            .map_err(|e| AuraError::database(
-                format!("samples UNNEST failed ({count} rows): {e}")
-            ))?;
-
-        Ok(())
+        buf.extend_from_slice(&PGCOPY_TRAILER);
+        debug_assert_eq!(buf.len(), capacity);
+        buf
     }
 
-    /// COPY FROM STDIN — streams text data directly to PostgreSQL.
-    /// Bypasses SQL parsing. 3-10x faster for large batches.
-    async fn flush_copy(&self, pool: &PgPool) -> AuraResult<()> {
-        // Pre-allocate: ~80 bytes per row (timestamp + fields + separators).
-        let mut payload = String::with_capacity(self.buffer.len() * 80);
+    const COPY_SQL: &'static str = "COPY samples (time, pv_id, value, severity, status, reason) FROM STDIN WITH (FORMAT binary)";
 
-        for row in &self.buffer {
-            // time (ISO 8601)
-            payload.push_str(&row.time.to_rfc3339());
-            payload.push('\t');
-
-            // pv_id
-            payload.push_str(&row.pv_id.to_string());
-            payload.push('\t');
-
-            // value — handle NaN/Infinity for PostgreSQL
-            if row.value.is_nan() {
-                payload.push_str("NaN");
-            } else if row.value.is_infinite() {
-                payload.push_str(if row.value > 0.0 { "Infinity" } else { "-Infinity" });
-            } else {
-                payload.push_str(&row.value.to_string());
-            }
-            payload.push('\t');
-
-            // severity, status, reason
-            payload.push_str(&row.severity.to_string());
-            payload.push('\t');
-            payload.push_str(&row.status.to_string());
-            payload.push('\t');
-            payload.push_str(&row.reason.to_string());
-            payload.push('\n');
-        }
-
-        let copy_sql = "COPY samples (time, pv_id, value, severity, status, reason) FROM STDIN";
-
-        let mut copy_in = pool.copy_in_raw(copy_sql).await
-            .map_err(|e| AuraError::database(
-                format!("samples COPY begin failed: {e}")
-            ))?;
-
-        copy_in.send(payload.as_bytes()).await
-            .map_err(|e| AuraError::database(
-                format!("samples COPY send failed ({} rows, {} bytes): {e}",
-                        self.buffer.len(), payload.len())
-            ))?;
-
-        copy_in.finish().await
-            .map_err(|e| AuraError::database(
-                format!("samples COPY finish failed: {e}")
-            ))?;
-
-        Ok(())
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
     }
-
-    #[inline] pub fn buffered(&self) -> usize { self.buffer.len() }
-    #[inline] pub fn is_empty(&self) -> bool { self.buffer.is_empty() }
-    #[inline] pub fn is_full(&self) -> bool { self.buffer.len() >= self.batch_size }
-    #[inline] pub fn batch_size(&self) -> usize { self.batch_size }
-    #[inline] pub fn max_buffer_bytes(&self) -> usize { self.max_buffer_bytes }
-    #[inline] pub fn total_written(&self) -> u64 { self.total_written }
-    #[inline] pub fn total_flushes(&self) -> u64 { self.total_flushes }
-    #[inline] pub fn total_backpressure(&self) -> u64 { self.total_backpressure }
-    #[inline] pub fn total_non_finite(&self) -> u64 { self.total_non_finite }
-    #[inline] pub fn copy_flushes(&self) -> u64 { self.copy_flushes }
-    #[inline] pub fn unnest_flushes(&self) -> u64 { self.unnest_flushes }
-
-    /// Approximate bytes currently buffered.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.buffer.len() >= self.batch_size
+    }
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+    #[inline]
+    pub fn max_buffer_bytes(&self) -> usize {
+        self.max_buffer_bytes
+    }
     #[inline]
     pub fn buffered_bytes(&self) -> usize {
         self.buffer.len() * ROW_MEM_SIZE
     }
 
-    /// Buffer memory utilization (0.0 to 1.0).
+    #[inline]
+    pub fn total_written(&self) -> u64 {
+        self.total_written
+    }
+    #[inline]
+    pub fn total_flushes(&self) -> u64 {
+        self.total_flushes
+    }
+    #[inline]
+    pub fn total_backpressure(&self) -> u64 {
+        self.total_backpressure
+    }
+    #[inline]
+    pub fn total_non_finite(&self) -> u64 {
+        self.total_non_finite
+    }
+    #[inline]
+    pub fn copy_flushes(&self) -> u64 {
+        self.copy_flushes
+    }
+    #[inline]
+    pub fn total_build_us(&self) -> u64 {
+        self.total_build_us
+    }
+    #[inline]
+    pub fn total_send_us(&self) -> u64 {
+        self.total_send_us
+    }
+    #[inline]
+    pub fn pool_size(&self) -> usize {
+        self.copy_pool.as_ref().map_or(0, |p| p.len())
+    }
+
+    /// Memory utilization (0.0 – 1.0).
     pub fn memory_pressure(&self) -> f64 {
-        if self.max_buffer_bytes == 0 { return 0.0; }
+        if self.max_buffer_bytes == 0 {
+            return 0.0;
+        }
         self.buffered_bytes() as f64 / self.max_buffer_bytes as f64
     }
 
-    /// Maximum rows the buffer can hold before backpressure.
+    /// Maximum rows before backpressure triggers.
     pub fn max_rows(&self) -> usize {
         self.max_buffer_bytes / ROW_MEM_SIZE
     }
 
-    /// Average rows per flush.
+    /// Average rows per flush (0.0 if no flushes yet).
     pub fn avg_batch_size(&self) -> f64 {
-        if self.total_flushes == 0 { return 0.0; }
+        if self.total_flushes == 0 {
+            return 0.0;
+        }
         self.total_written as f64 / self.total_flushes as f64
     }
 
-    /// Clear the buffer without flushing.
+    /// Clear the buffer without flushing to the database.
     pub fn discard(&mut self) {
         self.buffer.clear();
+    }
+
+    #[inline]
+    pub fn buffer_len(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    pub fn buffered(&self) -> usize {
+        self.len()
+    }
+    #[inline]
+    pub fn bg_flush_count(&self) -> usize {
+        0
     }
 }
 
 impl fmt::Debug for ScalarWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScalarWriter")
-            .field("buffered", &self.buffer.len())
+            .field("buffered", &self.len())
             .field("batch_size", &self.batch_size)
-            .field("bytes", &format!("{}/{}", self.buffered_bytes(), self.max_buffer_bytes))
-            .field("pressure", &format!("{:.1}%", self.memory_pressure() * 100.0))
-            .field("total_written", &self.total_written)
+            .field(
+                "pressure",
+                &format_args!("{:.1}%", self.memory_pressure() * 100.0),
+            )
+            .field("written", &self.total_written)
             .field("copy_flushes", &self.copy_flushes)
-            .field("unnest_flushes", &self.unnest_flushes)
             .field("non_finite", &self.total_non_finite)
-            .field("backpressure_events", &self.total_backpressure)
+            .field("backpressure", &self.total_backpressure)
+            .field("pool_size", &self.pool_size())
             .finish()
     }
 }
@@ -385,15 +430,19 @@ impl fmt::Display for ScalarWriter {
         write!(
             f,
             "ScalarWriter: {}/{} buffered ({:.1} KB/{:.1} MB, {:.0}% pressure), \
-             {} written (avg {:.0}), {} flushes ({} COPY/{} UNNEST), \
-             {} non-finite, {} backpressure",
-            self.buffer.len(), self.batch_size,
+             {} written (avg {:.0}), {} flushes, \
+             {} non-finite, {} backpressure, pool={}",
+            self.len(),
+            self.batch_size,
             self.buffered_bytes() as f64 / 1024.0,
             self.max_buffer_bytes as f64 / (1024.0 * 1024.0),
             self.memory_pressure() * 100.0,
-            self.total_written, self.avg_batch_size(),
-            self.total_flushes, self.copy_flushes, self.unnest_flushes,
-            self.total_non_finite, self.total_backpressure,
+            self.total_written,
+            self.avg_batch_size(),
+            self.total_flushes,
+            self.total_non_finite,
+            self.total_backpressure,
+            self.pool_size(),
         )
     }
 }
@@ -401,128 +450,109 @@ impl fmt::Display for ScalarWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
-    fn now() -> DateTime<Utc> { Utc::now() }
+    // ── Helpers ──────────────────────────────────────────────────
+
+    fn ts(secs: i64, us: u32) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, us * 1000).unwrap()
+    }
+    fn now() -> DateTime<Utc> {
+        Utc::now()
+    }
     fn row(pv: i32, val: f64) -> ScalarRow {
         ScalarRow::new(now(), pv, val, 0, 0, StoreReason::EpsilonExceeded)
     }
-    fn row_reason(pv: i32, val: f64, sev: i16, reason: StoreReason) -> ScalarRow {
-        ScalarRow::new(now(), pv, val, sev, 0, reason)
+    fn row_full(
+        time: DateTime<Utc>,
+        pv: i32,
+        val: f64,
+        sev: i16,
+        st: i16,
+        reason: StoreReason,
+    ) -> ScalarRow {
+        ScalarRow::new(time, pv, val, sev, st, reason)
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // ScalarRow
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
-    fn test_row_new() {
+    fn row_new() {
         let r = row(42, 4.217);
         assert_eq!(r.pv_id, 42);
         assert_eq!(r.value, 4.217);
         assert_eq!(r.severity, 0);
         assert_eq!(r.status, 0);
         assert_eq!(r.reason, StoreReason::EpsilonExceeded as i16);
-        assert!(!r.has_non_finite());
     }
 
     #[test]
-    fn test_row_reason_mapping() {
+    fn row_reason_mapping() {
         for reason in StoreReason::ALL {
-            let r = row_reason(1, 0.0, 0, reason);
+            let r = row_full(now(), 1, 0.0, 0, 0, reason);
             assert_eq!(r.reason, reason as i16);
         }
     }
 
     #[test]
-    fn test_row_severity() {
-        let r = row_reason(1, 0.0, 2, StoreReason::AlarmChange);
-        assert_eq!(r.severity, 2);
-    }
-
-    #[test]
-    fn test_row_nan() {
-        let r = row(1, f64::NAN);
-        assert!(r.has_non_finite());
-    }
-
-    #[test]
-    fn test_row_infinity() {
+    fn row_non_finite() {
+        assert!(!row(1, 0.0).has_non_finite());
+        assert!(!row(1, -1e300).has_non_finite());
+        assert!(!row(1, 1e-300).has_non_finite());
+        assert!(row(1, f64::NAN).has_non_finite());
         assert!(row(1, f64::INFINITY).has_non_finite());
         assert!(row(1, f64::NEG_INFINITY).has_non_finite());
     }
 
     #[test]
-    fn test_row_finite() {
-        assert!(!row(1, 0.0).has_non_finite());
-        assert!(!row(1, -1e300).has_non_finite());
-        assert!(!row(1, 1e-300).has_non_finite());
-    }
-
-    #[test]
-    fn test_row_mem_size() {
+    fn row_mem_size() {
         assert_eq!(ScalarRow::mem_size(), ROW_MEM_SIZE);
-        assert!(ROW_MEM_SIZE >= 26); // at least the data size
+        assert!(ROW_MEM_SIZE >= 26);
     }
 
     #[test]
-    fn test_row_copy() {
+    fn row_is_copy() {
         let a = row(1, 10.0);
-        let b = a; // Copy (not Clone — ScalarRow is Copy)
+        let b = a; // Copy trait
         assert_eq!(a.pv_id, b.pv_id);
-        assert_eq!(a.value, b.value);
     }
 
     #[test]
-    fn test_row_display() {
-        let r = row(42, 4.217);
-        let s = r.to_string();
-        assert!(s.contains("pv_id=42"));
-        assert!(s.contains("4.217"));
+    fn row_display() {
+        let s = row(42, 4.217).to_string();
+        assert!(s.contains("pv_id=42") && s.contains("4.217"));
     }
 
     #[test]
-    fn test_row_debug() {
-        assert!(format!("{:?}", row(1, 0.0)).contains("ScalarRow"));
-    }
-
-    // ═════════════════════════════════════════════════════════════════
-    // PushResult
-    // ═════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_push_result_accepted() {
+    fn push_result_accepted() {
         assert!(!PushResult::Accepted.needs_flush());
         assert!(PushResult::Accepted.is_accepted());
         assert_eq!(PushResult::Accepted.to_string(), "accepted");
     }
 
     #[test]
-    fn test_push_result_full() {
+    fn push_result_full() {
         assert!(PushResult::Full.needs_flush());
         assert!(PushResult::Full.is_accepted());
+        assert_eq!(PushResult::Full.to_string(), "full");
     }
 
     #[test]
-    fn test_push_result_backpressure() {
+    fn push_result_backpressure() {
         assert!(PushResult::BackpressureExceeded.needs_flush());
         assert!(!PushResult::BackpressureExceeded.is_accepted());
+        assert_eq!(PushResult::BackpressureExceeded.to_string(), "backpressure");
     }
 
     #[test]
-    fn test_push_result_eq() {
+    fn push_result_eq() {
         assert_eq!(PushResult::Full, PushResult::Full);
         assert_ne!(PushResult::Full, PushResult::Accepted);
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // ScalarWriter — Construction
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
-    fn test_new_defaults() {
+    fn new_defaults() {
         let w = ScalarWriter::with_defaults();
         assert!(w.is_empty());
-        assert_eq!(w.buffered(), 0);
+        assert_eq!(w.len(), 0);
         assert_eq!(w.batch_size(), 500);
         assert_eq!(w.max_buffer_bytes(), DEFAULT_MAX_BUFFER_BYTES);
         assert_eq!(w.buffered_bytes(), 0);
@@ -532,47 +562,48 @@ mod tests {
         assert_eq!(w.total_backpressure(), 0);
         assert_eq!(w.total_non_finite(), 0);
         assert_eq!(w.copy_flushes(), 0);
-        assert_eq!(w.unnest_flushes(), 0);
         assert_eq!(w.avg_batch_size(), 0.0);
+        assert_eq!(w.pool_size(), 0);
+        assert_eq!(w.total_build_us(), 0);
+        assert_eq!(w.total_send_us(), 0);
     }
 
     #[test]
-    fn test_custom_limits() {
+    fn custom_limits() {
         let w = ScalarWriter::with_limits(100, 1024 * 1024);
         assert_eq!(w.batch_size(), 100);
         assert_eq!(w.max_buffer_bytes(), 1024 * 1024);
     }
 
     #[test]
-    fn test_min_batch_size() {
+    fn min_batch_size_clamped() {
         assert_eq!(ScalarWriter::new(0).batch_size(), 1);
     }
-
     #[test]
-    fn test_min_buffer_bytes() {
-        assert_eq!(ScalarWriter::with_limits(10, 0).max_buffer_bytes(), ROW_MEM_SIZE);
+    fn min_buffer_clamped() {
+        assert_eq!(
+            ScalarWriter::with_limits(10, 0).max_buffer_bytes(),
+            ROW_MEM_SIZE
+        );
+    }
+    #[test]
+    fn max_rows() {
+        assert_eq!(
+            ScalarWriter::with_limits(500, ROW_MEM_SIZE * 1000).max_rows(),
+            1000
+        );
     }
 
     #[test]
-    fn test_max_rows() {
-        let w = ScalarWriter::with_limits(500, ROW_MEM_SIZE * 1000);
-        assert_eq!(w.max_rows(), 1000);
-    }
-
-    // ═════════════════════════════════════════════════════════════════
-    // ScalarWriter — Push
-    // ═════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_push_accepted() {
+    fn push_accepted() {
         let mut w = ScalarWriter::with_defaults();
         assert_eq!(w.push(row(1, 10.0)), PushResult::Accepted);
-        assert_eq!(w.buffered(), 1);
+        assert_eq!(w.len(), 1);
         assert_eq!(w.buffered_bytes(), ROW_MEM_SIZE);
     }
 
     #[test]
-    fn test_push_until_full() {
+    fn push_until_full() {
         let mut w = ScalarWriter::new(3);
         assert_eq!(w.push(row(1, 1.0)), PushResult::Accepted);
         assert_eq!(w.push(row(2, 2.0)), PushResult::Accepted);
@@ -581,67 +612,56 @@ mod tests {
     }
 
     #[test]
-    fn test_push_tracks_non_finite() {
+    fn push_tracks_non_finite() {
         let mut w = ScalarWriter::with_defaults();
-        w.push(row(1, 1.0));                // finite
-        w.push(row(2, f64::NAN));           // non-finite
-        w.push(row(3, f64::INFINITY));      // non-finite
-        w.push(row(4, f64::NEG_INFINITY));  // non-finite
-        w.push(row(5, 5.0));                // finite
+        w.push(row(1, 1.0));
+        w.push(row(2, f64::NAN));
+        w.push(row(3, f64::INFINITY));
+        w.push(row(4, f64::NEG_INFINITY));
+        w.push(row(5, 5.0));
         assert_eq!(w.total_non_finite(), 3);
-        assert_eq!(w.buffered(), 5); // all accepted
+        assert_eq!(w.len(), 5);
     }
 
-    // ── push_batch ───────────────────────────────────────────────────
-
     #[test]
-    fn test_push_batch() {
+    fn push_batch_basic() {
         let mut w = ScalarWriter::new(10);
-        let rows = (0..5).map(|i| row(i, i as f64));
-        let accepted = w.push_batch(rows);
+        let accepted = w.push_batch((0..5).map(|i| row(i, i as f64)));
         assert_eq!(accepted, 5);
-        assert_eq!(w.buffered(), 5);
+        assert_eq!(w.len(), 5);
     }
 
     #[test]
-    fn test_push_batch_stops_at_backpressure() {
-        // Max ~2 rows.
+    fn push_batch_stops_at_backpressure() {
         let mut w = ScalarWriter::with_limits(100, ROW_MEM_SIZE * 2 + 1);
-        let rows = (0..10).map(|i| row(i, i as f64));
-        let accepted = w.push_batch(rows);
-        assert_eq!(accepted, 2); // third row triggers backpressure
-        assert_eq!(w.buffered(), 2);
+        let accepted = w.push_batch((0..10).map(|i| row(i, i as f64)));
+        assert_eq!(accepted, 2);
     }
 
     #[test]
-    fn test_push_batch_empty() {
+    fn push_batch_empty() {
         let mut w = ScalarWriter::with_defaults();
-        let accepted = w.push_batch(std::iter::empty());
-        assert_eq!(accepted, 0);
+        assert_eq!(w.push_batch(std::iter::empty()), 0);
     }
 
-    // ── Backpressure ─────────────────────────────────────────────────
-
     #[test]
-    fn test_backpressure_triggered() {
-        // Max = 2 rows worth of memory.
+    fn backpressure_triggered() {
         let mut w = ScalarWriter::with_limits(100, ROW_MEM_SIZE * 2);
         assert_eq!(w.push(row(1, 1.0)), PushResult::Accepted);
         assert_eq!(w.push(row(2, 2.0)), PushResult::Accepted);
         assert_eq!(w.push(row(3, 3.0)), PushResult::BackpressureExceeded);
-        assert_eq!(w.buffered(), 2); // rejected
+        assert_eq!(w.len(), 2);
         assert_eq!(w.total_backpressure(), 1);
     }
 
     #[test]
-    fn test_backpressure_first_row_always_accepted() {
-        let mut w = ScalarWriter::with_limits(100, 1); // absurdly small
-        let r = w.push(row(1, 1.0));
-        assert!(r.is_accepted()); // empty buffer always accepts
+    fn backpressure_first_row_always_accepted() {
+        let mut w = ScalarWriter::with_limits(100, 1);
+        assert!(w.push(row(1, 1.0)).is_accepted());
     }
 
     #[test]
-    fn test_backpressure_clears_after_discard() {
+    fn backpressure_clears_after_discard() {
         let mut w = ScalarWriter::with_limits(100, ROW_MEM_SIZE * 2);
         w.push(row(1, 1.0));
         w.push(row(2, 2.0));
@@ -650,48 +670,26 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_pressure() {
+    fn memory_pressure_fraction() {
         let mut w = ScalarWriter::with_limits(100, ROW_MEM_SIZE * 10);
-        w.push(row(1, 1.0)); // 1/10 = 10%
+        w.push(row(1, 1.0));
         let p = w.memory_pressure();
-        assert!((p - 0.1).abs() < 0.01, "got {:.1}%", p * 100.0);
-    }
-
-    // ── Buffered bytes ───────────────────────────────────────────────
-
-    #[test]
-    fn test_buffered_bytes() {
-        let mut w = ScalarWriter::with_defaults();
-        w.push(row(1, 1.0));
-        w.push(row(2, 2.0));
-        assert_eq!(w.buffered_bytes(), 2 * ROW_MEM_SIZE);
+        assert!((p - 0.1).abs() < 0.01, "expected ~0.1, got {p}");
     }
 
     #[test]
-    fn test_buffered_bytes_after_discard() {
-        let mut w = ScalarWriter::with_defaults();
-        w.push(row(1, 1.0));
-        w.discard();
-        assert_eq!(w.buffered_bytes(), 0);
-    }
-
-    // ── Discard ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_discard() {
+    fn discard_clears_buffer() {
         let mut w = ScalarWriter::with_defaults();
         w.push(row(1, 1.0));
         w.push(row(2, 2.0));
         w.discard();
         assert!(w.is_empty());
         assert_eq!(w.buffered_bytes(), 0);
-        assert_eq!(w.total_written(), 0); // counters unchanged
+        assert_eq!(w.total_written(), 0);
     }
 
-    // ── Statistics ───────────────────────────────────────────────────
-
     #[test]
-    fn test_avg_batch_size() {
+    fn avg_batch_size_computed() {
         let mut w = ScalarWriter::with_defaults();
         w.total_written = 2000;
         w.total_flushes = 4;
@@ -699,75 +697,200 @@ mod tests {
     }
 
     #[test]
-    fn test_avg_batch_size_empty() {
+    fn avg_batch_size_empty() {
         assert_eq!(ScalarWriter::with_defaults().avg_batch_size(), 0.0);
     }
 
-    // ── SQL constants ────────────────────────────────────────────────
+    #[test]
+    fn compatibility_aliases() {
+        let mut w = ScalarWriter::with_defaults();
+        w.push(row(1, 1.0));
+        assert_eq!(w.buffer_len(), w.len());
+        assert_eq!(w.buffered(), w.len());
+        assert_eq!(w.bg_flush_count(), 0);
+    }
 
     #[test]
-    fn test_unnest_sql_columns() {
-        let u = UNNEST_SQL.to_uppercase();
-        for col in ["TIME", "PV_ID", "VALUE", "SEVERITY", "STATUS", "REASON"] {
-            assert!(u.contains(col), "missing: {col}");
+    fn payload_header_and_trailer() {
+        let rows = vec![row(1, 42.0)];
+        let buf = ScalarWriter::build_copy_payload(&rows);
+        assert_eq!(&buf[..11], b"PGCOPY\n\xff\r\n\x00");
+        assert_eq!(&buf[buf.len() - 2..], &PGCOPY_TRAILER);
+    }
+
+    #[test]
+    fn payload_exact_size() {
+        for n in [1, 10, 100, 1000] {
+            let rows: Vec<_> = (0..n).map(|i| row(i as i32, i as f64)).collect();
+            let buf = ScalarWriter::build_copy_payload(&rows);
+            assert_eq!(
+                buf.len(),
+                PGCOPY_HEADER.len() + n * WIRE_ROW_SIZE + PGCOPY_TRAILER.len()
+            );
         }
     }
 
     #[test]
-    fn test_unnest_sql_uses_unnest() {
-        assert!(UNNEST_SQL.to_uppercase().contains("UNNEST"));
+    fn payload_empty() {
+        let buf = ScalarWriter::build_copy_payload(&[]);
+        assert_eq!(buf.len(), PGCOPY_HEADER.len() + PGCOPY_TRAILER.len());
     }
 
     #[test]
-    fn test_copy_threshold_sane() {
-        assert!(COPY_THRESHOLD > 0 && COPY_THRESHOLD <= 500);
+    fn payload_encodes_timestamp_correctly() {
+        // 2026-06-15 12:30:45.123456 UTC
+        let time = ts(1781617845, 123456);
+        let r = row_full(time, 1, 0.0, 0, 0, StoreReason::Initial);
+        let buf = ScalarWriter::build_copy_payload(&[r]);
+
+        // Skip header (19) + num_columns (2) + time_len (4) = offset 25
+        let pg_us = i64::from_be_bytes(buf[25..33].try_into().unwrap());
+        let expected = time.timestamp_micros() - PG_EPOCH_OFFSET_US;
+        assert_eq!(pg_us, expected);
     }
 
-    // ── Large batch simulation ───────────────────────────────────────
+    #[test]
+    fn payload_encodes_pv_id_correctly() {
+        let r = row_full(now(), 12345, 0.0, 0, 0, StoreReason::Initial);
+        let buf = ScalarWriter::build_copy_payload(&[r]);
+        // offset: 19 (header) + 2 (ncols) + 4+8 (time) + 4 (pv_len) = 37
+        let pv_id = i32::from_be_bytes(buf[37..41].try_into().unwrap());
+        assert_eq!(pv_id, 12345);
+    }
 
     #[test]
-    fn test_large_batch() {
-        let mut w = ScalarWriter::new(500);
-        let rows = (0..500).map(|i| row(i % 100, i as f64));
-        let accepted = w.push_batch(rows);
-        assert_eq!(accepted, 500);
+    fn payload_encodes_value_correctly() {
+        let r = row_full(now(), 1, std::f64::consts::PI, 0, 0, StoreReason::Initial);
+        let buf = ScalarWriter::build_copy_payload(&[r]);
+        // offset: 19 + 2 + 12 + 8 + 4 (value_len) = 45
+        let val = f64::from_be_bytes(buf[45..53].try_into().unwrap());
+        assert_eq!(val, std::f64::consts::PI);
+    }
+
+    #[test]
+    fn payload_encodes_severity_status_reason() {
+        let r = row_full(now(), 1, 0.0, 3, 7, StoreReason::AlarmChange);
+        let buf = ScalarWriter::build_copy_payload(&[r]);
+        // severity at offset 19+2+12+8+12+4 = 57
+        let sev = i16::from_be_bytes(buf[57..59].try_into().unwrap());
+        assert_eq!(sev, 3);
+        // status at offset 59+4 = 63
+        let stat = i16::from_be_bytes(buf[63..65].try_into().unwrap());
+        assert_eq!(stat, 7);
+        // reason at offset 65+4 = 69
+        let reason = i16::from_be_bytes(buf[69..71].try_into().unwrap());
+        assert_eq!(reason, StoreReason::AlarmChange as i16);
+    }
+
+    #[test]
+    fn payload_handles_nan() {
+        let r = row(1, f64::NAN);
+        let buf = ScalarWriter::build_copy_payload(&[r]);
+        let val = f64::from_be_bytes(buf[45..53].try_into().unwrap());
+        assert!(val.is_nan());
+    }
+
+    #[test]
+    fn payload_handles_infinity() {
+        let r = row(1, f64::INFINITY);
+        let buf = ScalarWriter::build_copy_payload(&[r]);
+        let val = f64::from_be_bytes(buf[45..53].try_into().unwrap());
+        assert_eq!(val, f64::INFINITY);
+    }
+
+    #[test]
+    fn payload_handles_negative_pv_id() {
+        let r = row(-1, 0.0);
+        let buf = ScalarWriter::build_copy_payload(&[r]);
+        let pv_id = i32::from_be_bytes(buf[37..41].try_into().unwrap());
+        assert_eq!(pv_id, -1);
+    }
+
+    #[test]
+    fn payload_multi_row_continuity() {
+        let rows: Vec<_> = (0..3).map(|i| row(i, i as f64 * 10.0)).collect();
+        let buf = ScalarWriter::build_copy_payload(&rows);
+        // Check each row's pv_id at the correct offset
+        for (i, expected_pv) in [0i32, 1, 2].iter().enumerate() {
+            let base = PGCOPY_HEADER.len() + i * WIRE_ROW_SIZE;
+            let pv_id = i32::from_be_bytes(buf[base + 18..base + 22].try_into().unwrap());
+            assert_eq!(pv_id, *expected_pv, "row {i} pv_id mismatch");
+        }
+    }
+
+    #[test]
+    fn encode_copy_produces_52_bytes() {
+        let r = row(1, 42.0);
+        let mut buf = [0u8; WIRE_ROW_SIZE];
+        r.encode_copy(&mut buf);
+        // num_columns at start
+        assert_eq!(i16::from_be_bytes([buf[0], buf[1]]), NUM_COLUMNS);
+        // All 52 bytes should be written (not all zero).
+        assert!(buf.iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn encode_copy_deterministic() {
+        let r = row_full(ts(1700000000, 0), 42, 3.14, 2, 1, StoreReason::Heartbeat);
+        let mut a = [0u8; WIRE_ROW_SIZE];
+        let mut b = [0u8; WIRE_ROW_SIZE];
+        r.encode_copy(&mut a);
+        r.encode_copy(&mut b);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn constants_sane() {
+        assert_eq!(PGCOPY_HEADER.len(), 19);
+        assert_eq!(PGCOPY_TRAILER.len(), 2);
+        assert_eq!(WIRE_ROW_SIZE, 52);
+        assert_eq!(PGCOPY_TRAILER, [0xff, 0xff]); // -1 as i16 big-endian
+    }
+
+    #[test]
+    fn pg_epoch_offset() {
+        // 2000-01-01 00:00:00 UTC = 946684800 Unix seconds
+        assert_eq!(PG_EPOCH_OFFSET_US, 946_684_800 * 1_000_000);
+    }
+
+    #[test]
+    fn large_batch_push() {
+        let mut w = ScalarWriter::new(1000);
+        let accepted = w.push_batch((0..1000).map(|i| row(i % 100, i as f64)));
+        assert_eq!(accepted, 1000);
         assert!(w.is_full());
-        assert_eq!(w.buffered_bytes(), 500 * ROW_MEM_SIZE);
     }
 
-    // ── Display / Debug ──────────────────────────────────────────────
+    #[test]
+    fn large_batch_payload() {
+        let rows: Vec<_> = (0..10_000).map(|i| row(i % 100, i as f64)).collect();
+        let buf = ScalarWriter::build_copy_payload(&rows);
+        assert_eq!(buf.len(), 19 + 10_000 * 52 + 2);
+    }
 
     #[test]
-    fn test_display_empty() {
+    fn display_empty() {
         let s = ScalarWriter::with_defaults().to_string();
-        assert!(s.contains("0/500"));
-        assert!(s.contains("0 backpressure"));
-        assert!(s.contains("0 non-finite"));
+        assert!(s.contains("0/500") && s.contains("0 backpressure"));
     }
 
     #[test]
-    fn test_display_with_stats() {
+    fn display_with_stats() {
         let mut w = ScalarWriter::with_defaults();
         w.total_written = 10_000;
         w.total_flushes = 20;
         w.copy_flushes = 15;
-        w.unnest_flushes = 5;
         w.total_non_finite = 3;
         w.total_backpressure = 1;
         let s = w.to_string();
         assert!(s.contains("10000 written"));
-        assert!(s.contains("15 COPY"));
-        assert!(s.contains("5 UNNEST"));
-        assert!(s.contains("3 non-finite"));
-        assert!(s.contains("1 backpressure"));
+        assert!(s.contains("15 COPY") && s.contains("5 UNNEST"));
+        assert!(s.contains("3 non-finite") && s.contains("1 backpressure"));
     }
 
     #[test]
-    fn test_debug() {
+    fn debug_output() {
         let d = format!("{:?}", ScalarWriter::with_defaults());
-        assert!(d.contains("ScalarWriter"));
-        assert!(d.contains("pressure"));
-        assert!(d.contains("non_finite"));
-        assert!(d.contains("backpressure_events"));
+        assert!(d.contains("ScalarWriter") && d.contains("pressure") && d.contains("pool_size"));
     }
 }

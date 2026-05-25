@@ -5,24 +5,13 @@
 //! BYTEA columns with variable-length blobs don't benefit from array
 //! batching and would double memory (buffer + UNNEST copy).
 //!
-//! ## Performance
-//!
-//! - **Backpressure**: hard memory limit (`max_buffer_bytes`, default
-//!   128 MB) prevents OOM from buffering too many large frames.
-//! - **Incremental byte tracking**: `current_bytes` updated on push,
-//!   no O(N) scan in `buffered_bytes()`.
-//! - **Pre-computed `mem_size()`**: each `ImageRow` knows its heap cost.
-//! - **SQL as `&'static str`**: prepared statement cache friendly.
-//! - **Compression ratio tracking**: `avg_compression_ratio()` helps
-//!   monitor codec effectiveness.
-//!
 //! Images bypass the deadband filter (every frame is stored), so the
 //! write rate is determined by the camera frame rate, not the filter.
 
 use chrono::{DateTime, Utc};
 use std::fmt;
 
-use sqlx::PgPool;
+use super::copy_pool::{CopyPool, PushResult};
 
 use aura_core::error::{AuraError, AuraResult};
 
@@ -42,7 +31,6 @@ const INSERT_SQL: &str = r#"
      dimensions, unique_id, attributes, severity, status)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 "#;
-
 
 /// A single row for `samples_image`.
 #[derive(Debug, Clone)]
@@ -75,10 +63,17 @@ impl ImageRow {
         status: i16,
     ) -> Self {
         Self {
-            time, pv_id, data, codec, compressed_size, uncompressed_size,
-            dimensions, unique_id,
+            time,
+            pv_id,
+            data,
+            codec,
+            compressed_size,
+            uncompressed_size,
+            dimensions,
+            unique_id,
             attributes: serde_json::Value::Object(Default::default()),
-            severity, status,
+            severity,
+            status,
         }
     }
 
@@ -90,66 +85,47 @@ impl ImageRow {
 
     /// Size of the pixel data payload in bytes.
     #[inline]
-    pub fn data_size(&self) -> usize { self.data.len() }
+    pub fn data_size(&self) -> usize {
+        self.data.len()
+    }
 
     /// Total estimated heap memory for this row.
     #[inline]
     pub fn mem_size(&self) -> usize {
-        ROW_OVERHEAD
-            + self.data.len()
-            + self.codec.len()
-            + self.dimensions.len() * 4
+        ROW_OVERHEAD + self.data.len() + self.codec.len() + self.dimensions.len() * 4
     }
 
     /// Compression ratio (uncompressed / compressed). Returns 1.0 if raw.
     pub fn compression_ratio(&self) -> f64 {
-        if self.compressed_size <= 0 || self.uncompressed_size <= 0 { return 1.0; }
+        if self.compressed_size <= 0 || self.uncompressed_size <= 0 {
+            return 1.0;
+        }
         self.uncompressed_size as f64 / self.compressed_size as f64
     }
 }
 
 impl fmt::Display for ImageRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "pv_id={} uid={} {}×{}px {:.1} KB ({})",
-               self.pv_id, self.unique_id,
-               self.dimensions.first().unwrap_or(&0),
-               self.dimensions.get(1).unwrap_or(&0),
-               self.data.len() as f64 / 1024.0,
-               self.codec)
-    }
-}
-
-/// Result of pushing a row into the buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PushResult {
-    Accepted,
-    Full,
-    BackpressureExceeded,
-}
-
-impl PushResult {
-    #[inline] pub fn needs_flush(&self) -> bool { !matches!(self, Self::Accepted) }
-    #[inline] pub fn is_accepted(&self) -> bool { !matches!(self, Self::BackpressureExceeded) }
-}
-
-impl fmt::Display for PushResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Accepted => "accepted", Self::Full => "full",
-            Self::BackpressureExceeded => "backpressure",
-        })
+        write!(
+            f,
+            "pv_id={} uid={} {}×{}px {:.1} KB ({})",
+            self.pv_id,
+            self.unique_id,
+            self.dimensions.first().unwrap_or(&0),
+            self.dimensions.get(1).unwrap_or(&0),
+            self.data.len() as f64 / 1024.0,
+            self.codec
+        )
     }
 }
 
 /// Batch writer for image samples (NTNDArray).
-///
-/// Buffers images and writes them in a single transaction.
-/// Backpressure prevents OOM from large frames.
 pub struct ImageWriter {
     batch_size: usize,
     max_buffer_bytes: usize,
     buffer: Vec<ImageRow>,
     current_bytes: usize,
+    copy_pool: Option<CopyPool>,
 
     total_written: u64,
     total_flushes: u64,
@@ -170,23 +146,31 @@ impl ImageWriter {
             max_buffer_bytes: max_buffer_bytes.max(1024),
             buffer: Vec::with_capacity(batch_size.min(64)),
             current_bytes: 0,
-            total_written: 0, total_flushes: 0,
-            total_bytes: 0, total_uncompressed_bytes: 0,
+            copy_pool: None,
+            total_written: 0,
+            total_flushes: 0,
+            total_bytes: 0,
+            total_uncompressed_bytes: 0,
             total_backpressure: 0,
         }
     }
 
     /// Default: batch 50, 128 MB limit.
-    pub fn with_defaults() -> Self { Self::new(50) }
+    pub fn with_defaults() -> Self {
+        Self::new(50)
+    }
+
+    /// Set the shared COPY pool.
+    pub fn set_copy_pool(&mut self, pool: CopyPool) {
+        self.copy_pool = Some(pool);
+    }
 
     /// Push an image row with backpressure.
     #[inline]
     pub fn push(&mut self, row: ImageRow) -> PushResult {
         let row_bytes = row.mem_size();
 
-        if !self.buffer.is_empty()
-            && self.current_bytes + row_bytes > self.max_buffer_bytes
-        {
+        if !self.buffer.is_empty() && self.current_bytes + row_bytes > self.max_buffer_bytes {
             self.total_backpressure += 1;
             return PushResult::BackpressureExceeded;
         }
@@ -194,43 +178,51 @@ impl ImageWriter {
         self.current_bytes += row_bytes;
         self.buffer.push(row);
 
-        if self.buffer.len() >= self.batch_size { PushResult::Full } else { PushResult::Accepted }
+        if self.buffer.len() >= self.batch_size {
+            PushResult::Full
+        } else {
+            PushResult::Accepted
+        }
     }
 
     /// Flush all buffered images in a single transaction.
-    pub async fn flush(&mut self, pool: &PgPool) -> AuraResult<usize> {
-        if self.buffer.is_empty() { return Ok(0); }
+    pub async fn flush(&mut self) -> AuraResult<usize> {
+        if self.buffer.is_empty() {
+            return Ok(0);
+        }
         let count = self.buffer.len();
 
-        let mut tx = pool.begin().await
-            .map_err(|e| AuraError::database(format!("image tx begin: {e}")))?;
+        let pool = self
+            .copy_pool
+            .as_ref()
+            .ok_or_else(|| AuraError::database("ImageWriter: no copy pool configured"))?;
 
         for row in &self.buffer {
-            sqlx::query(INSERT_SQL)
-                .bind(row.time)
-                .bind(row.pv_id)
-                .bind(&row.data)
-                .bind(&row.codec)
-                .bind(row.compressed_size)
-                .bind(row.uncompressed_size)
-                .bind(&row.dimensions)
-                .bind(row.unique_id)
-                .bind(&row.attributes)
-                .bind(row.severity)
-                .bind(row.status)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| AuraError::database(
-                    format!("image insert failed (pv_id={}, uid={}): {e}",
-                            row.pv_id, row.unique_id)
-                ))?;
+            pool.execute(
+                0,
+                INSERT_SQL,
+                &[
+                    &row.time as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &row.pv_id,
+                    &row.data,
+                    &row.codec,
+                    &row.compressed_size,
+                    &row.uncompressed_size,
+                    &row.dimensions,
+                    &row.unique_id,
+                    &row.attributes,
+                    &row.severity,
+                    &row.status,
+                ],
+            )
+            .await
+            .map_err(|e| {
+                AuraError::database(format!(
+                    "image insert failed (pv_id={}, uid={}): {e}",
+                    row.pv_id, row.unique_id
+                ))
+            })?;
         }
-
-        tx.commit().await
-            .map_err(|e| AuraError::database(
-                format!("image tx commit ({count} rows, {:.1} MB): {e}",
-                        self.current_bytes as f64 / (1024.0 * 1024.0))
-            ))?;
 
         for row in &self.buffer {
             self.total_bytes += row.data.len() as u64;
@@ -244,34 +236,73 @@ impl ImageWriter {
         Ok(count)
     }
 
-    #[inline] pub fn buffered(&self) -> usize { self.buffer.len() }
-    #[inline] pub fn is_empty(&self) -> bool { self.buffer.is_empty() }
-    #[inline] pub fn is_full(&self) -> bool { self.buffer.len() >= self.batch_size }
-    #[inline] pub fn batch_size(&self) -> usize { self.batch_size }
-    #[inline] pub fn max_buffer_bytes(&self) -> usize { self.max_buffer_bytes }
+    #[inline]
+    pub fn buffered(&self) -> usize {
+        self.buffer.len()
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.buffer.len() >= self.batch_size
+    }
+    #[inline]
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+    #[inline]
+    pub fn max_buffer_bytes(&self) -> usize {
+        self.max_buffer_bytes
+    }
     /// O(1) — tracked incrementally on push/flush.
-    #[inline] pub fn buffered_bytes(&self) -> usize { self.current_bytes }
-    #[inline] pub fn total_written(&self) -> u64 { self.total_written }
-    #[inline] pub fn total_flushes(&self) -> u64 { self.total_flushes }
-    #[inline] pub fn total_bytes(&self) -> u64 { self.total_bytes }
-    #[inline] pub fn total_uncompressed_bytes(&self) -> u64 { self.total_uncompressed_bytes }
-    #[inline] pub fn total_backpressure(&self) -> u64 { self.total_backpressure }
+    #[inline]
+    pub fn buffered_bytes(&self) -> usize {
+        self.current_bytes
+    }
+    #[inline]
+    pub fn total_written(&self) -> u64 {
+        self.total_written
+    }
+    #[inline]
+    pub fn total_flushes(&self) -> u64 {
+        self.total_flushes
+    }
+    #[inline]
+    pub fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+    #[inline]
+    pub fn total_uncompressed_bytes(&self) -> u64 {
+        self.total_uncompressed_bytes
+    }
+    #[inline]
+    pub fn total_backpressure(&self) -> u64 {
+        self.total_backpressure
+    }
 
     /// Buffer memory utilization (0.0 to 1.0).
     pub fn memory_pressure(&self) -> f64 {
-        if self.max_buffer_bytes == 0 { return 0.0; }
+        if self.max_buffer_bytes == 0 {
+            return 0.0;
+        }
         self.current_bytes as f64 / self.max_buffer_bytes as f64
     }
 
     /// Average compressed image size in bytes.
     pub fn avg_image_bytes(&self) -> f64 {
-        if self.total_written == 0 { return 0.0; }
+        if self.total_written == 0 {
+            return 0.0;
+        }
         self.total_bytes as f64 / self.total_written as f64
     }
 
     /// Average compression ratio across all written images.
     pub fn avg_compression_ratio(&self) -> f64 {
-        if self.total_bytes == 0 { return 1.0; }
+        if self.total_bytes == 0 {
+            return 1.0;
+        }
         self.total_uncompressed_bytes as f64 / self.total_bytes as f64
     }
 
@@ -287,11 +318,20 @@ impl fmt::Debug for ImageWriter {
         f.debug_struct("ImageWriter")
             .field("buffered", &self.buffer.len())
             .field("batch_size", &self.batch_size)
-            .field("bytes", &format!("{}/{}", self.current_bytes, self.max_buffer_bytes))
-            .field("pressure", &format!("{:.1}%", self.memory_pressure() * 100.0))
+            .field(
+                "bytes",
+                &format!("{}/{}", self.current_bytes, self.max_buffer_bytes),
+            )
+            .field(
+                "pressure",
+                &format!("{:.1}%", self.memory_pressure() * 100.0),
+            )
             .field("total_written", &self.total_written)
             .field("total_bytes", &self.total_bytes)
-            .field("compression", &format!("{:.1}×", self.avg_compression_ratio()))
+            .field(
+                "compression",
+                &format!("{:.1}×", self.avg_compression_ratio()),
+            )
             .field("backpressure", &self.total_backpressure)
             .finish()
     }
@@ -299,19 +339,23 @@ impl fmt::Debug for ImageWriter {
 
 impl fmt::Display for ImageWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f,
-               "ImageWriter: {}/{} ({:.1} MB/{:.0} MB, {:.0}%), \
+        write!(
+            f,
+            "ImageWriter: {}/{} ({:.1} MB/{:.0} MB, {:.0}%), \
              {} written ({:.1} MB, avg {:.0} KB, {:.1}× compression), \
              {} flushes, {} backpressure",
-               self.buffer.len(), self.batch_size,
-               self.current_bytes as f64 / (1024.0 * 1024.0),
-               self.max_buffer_bytes as f64 / (1024.0 * 1024.0),
-               self.memory_pressure() * 100.0,
-               self.total_written,
-               self.total_bytes as f64 / (1024.0 * 1024.0),
-               self.avg_image_bytes() / 1024.0,
-               self.avg_compression_ratio(),
-               self.total_flushes, self.total_backpressure)
+            self.buffer.len(),
+            self.batch_size,
+            self.current_bytes as f64 / (1024.0 * 1024.0),
+            self.max_buffer_bytes as f64 / (1024.0 * 1024.0),
+            self.memory_pressure() * 100.0,
+            self.total_written,
+            self.total_bytes as f64 / (1024.0 * 1024.0),
+            self.avg_image_bytes() / 1024.0,
+            self.avg_compression_ratio(),
+            self.total_flushes,
+            self.total_backpressure
+        )
     }
 }
 
@@ -322,25 +366,33 @@ mod tests {
 
     fn make_image(pv_id: i32, size: usize, uid: i32) -> ImageRow {
         ImageRow::new(
-            Utc::now(), pv_id,
-            vec![0u8; size], "raw".to_string(),
-            size as i64, size as i64,
-            vec![100, 100], uid, 0, 0,
+            Utc::now(),
+            pv_id,
+            vec![0u8; size],
+            "raw".to_string(),
+            size as i64,
+            size as i64,
+            vec![100, 100],
+            uid,
+            0,
+            0,
         )
     }
 
     fn make_compressed(pv_id: i32, compressed: usize, uncompressed: usize, uid: i32) -> ImageRow {
         ImageRow::new(
-            Utc::now(), pv_id,
-            vec![0u8; compressed], "jpeg".to_string(),
-            compressed as i64, uncompressed as i64,
-            vec![640, 480], uid, 0, 0,
+            Utc::now(),
+            pv_id,
+            vec![0u8; compressed],
+            "jpeg".to_string(),
+            compressed as i64,
+            uncompressed as i64,
+            vec![640, 480],
+            uid,
+            0,
+            0,
         )
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // ImageRow
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_row_new() {
@@ -357,8 +409,7 @@ mod tests {
 
     #[test]
     fn test_row_with_attributes() {
-        let r = make_image(1, 100, 1)
-            .with_attributes(json!({"exposure": 0.001, "gain": 2}));
+        let r = make_image(1, 100, 1).with_attributes(json!({"exposure": 0.001, "gain": 2}));
         assert_eq!(r.attributes["exposure"], 0.001);
         assert_eq!(r.attributes["gain"], 2);
     }
@@ -384,20 +435,58 @@ mod tests {
     #[test]
     fn test_row_mem_size_includes_codec() {
         let short_codec = ImageRow::new(
-            Utc::now(), 1, vec![0; 100], "raw".to_string(),
-            100, 100, vec![10, 10], 1, 0, 0,
+            Utc::now(),
+            1,
+            vec![0; 100],
+            "raw".to_string(),
+            100,
+            100,
+            vec![10, 10],
+            1,
+            0,
+            0,
         );
         let long_codec = ImageRow::new(
-            Utc::now(), 1, vec![0; 100], "blosc_lz4_shuffle_level9".to_string(),
-            100, 100, vec![10, 10], 1, 0, 0,
+            Utc::now(),
+            1,
+            vec![0; 100],
+            "blosc_lz4_shuffle_level9".to_string(),
+            100,
+            100,
+            vec![10, 10],
+            1,
+            0,
+            0,
         );
         assert!(long_codec.mem_size() > short_codec.mem_size());
     }
 
     #[test]
     fn test_row_mem_size_includes_dimensions() {
-        let d2 = ImageRow::new(Utc::now(), 1, vec![0; 100], "".to_string(), 100, 100, vec![10, 10], 1, 0, 0);
-        let d3 = ImageRow::new(Utc::now(), 1, vec![0; 100], "".to_string(), 100, 100, vec![10, 10, 10], 1, 0, 0);
+        let d2 = ImageRow::new(
+            Utc::now(),
+            1,
+            vec![0; 100],
+            "".to_string(),
+            100,
+            100,
+            vec![10, 10],
+            1,
+            0,
+            0,
+        );
+        let d3 = ImageRow::new(
+            Utc::now(),
+            1,
+            vec![0; 100],
+            "".to_string(),
+            100,
+            100,
+            vec![10, 10, 10],
+            1,
+            0,
+            0,
+        );
         assert!(d3.mem_size() > d2.mem_size());
     }
 
@@ -421,7 +510,18 @@ mod tests {
 
     #[test]
     fn test_row_compression_ratio_negative_safe() {
-        let r = ImageRow::new(Utc::now(), 1, vec![], "".to_string(), -1, -1, vec![], 1, 0, 0);
+        let r = ImageRow::new(
+            Utc::now(),
+            1,
+            vec![],
+            "".to_string(),
+            -1,
+            -1,
+            vec![],
+            1,
+            0,
+            0,
+        );
         assert!((r.compression_ratio() - 1.0).abs() < f64::EPSILON);
     }
 
@@ -455,10 +555,6 @@ mod tests {
         assert!(format!("{:?}", make_image(1, 100, 1)).contains("ImageRow"));
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // PushResult
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_push_result_accepted() {
         assert!(!PushResult::Accepted.needs_flush());
@@ -485,10 +581,6 @@ mod tests {
         assert_eq!(PushResult::Full, PushResult::Full);
         assert_ne!(PushResult::Full, PushResult::Accepted);
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // ImageWriter — Construction
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_writer_defaults() {
@@ -523,10 +615,6 @@ mod tests {
     fn test_min_buffer_bytes() {
         assert_eq!(ImageWriter::with_limits(10, 0).max_buffer_bytes(), 1024);
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // ImageWriter — Push
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_push_accepted() {
@@ -566,7 +654,10 @@ mod tests {
         let r = w.push(make_image(2, 1000, 2));
         let mut w2 = ImageWriter::with_limits(100, 1500);
         assert!(w2.push(make_image(1, 1000, 1)).is_accepted());
-        assert_eq!(w2.push(make_image(2, 1000, 2)), PushResult::BackpressureExceeded);
+        assert_eq!(
+            w2.push(make_image(2, 1000, 2)),
+            PushResult::BackpressureExceeded
+        );
         assert!(w2.total_backpressure() > 0);
         // Only 1 image buffered (second was rejected)
         assert_eq!(w2.buffered(), 1);
@@ -584,14 +675,13 @@ mod tests {
     fn test_backpressure_clears_after_discard() {
         let mut w = ImageWriter::with_limits(100, 1500);
         w.push(make_image(1, 1000, 1));
-        assert_eq!(w.push(make_image(2, 1000, 2)), PushResult::BackpressureExceeded);
+        assert_eq!(
+            w.push(make_image(2, 1000, 2)),
+            PushResult::BackpressureExceeded
+        );
         w.discard();
         assert!(w.push(make_image(3, 1000, 3)).is_accepted());
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // ImageWriter — Statistics
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_avg_image_bytes() {
@@ -635,10 +725,6 @@ mod tests {
         assert!(p > 0.4 && p < 0.7, "pressure={p}"); // ~5200/10000
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // ImageWriter — Discard
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_discard() {
         let mut w = ImageWriter::with_defaults();
@@ -648,10 +734,6 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(w.buffered_bytes(), 0);
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // SQL & Display
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_insert_sql() {
