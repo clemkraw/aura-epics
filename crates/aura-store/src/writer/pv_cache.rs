@@ -1,6 +1,6 @@
 //! PV name → numeric ID resolution cache.
 //!
-//! Every sample row stores `pv_id` (4 bytes INTEGER) instead of `pv_name` (20-60 bytes TEXT).
+//! Every sample row stores `pv_id` (4 bytes INTEGER) instead of `pv_name`.
 //!
 //! ## Hot path
 //!
@@ -13,7 +13,6 @@
 //! PV IDs are immutable — once assigned, they never change. The cache
 //! never evicts entries. A hard limit (`max_entries`) prevents unbounded
 //! growth if a misconfigured IOC publishes millions of unique PV names.
-//! Default: 500k entries ≈ 40 MB (80 bytes per entry average).
 //!
 //! ## Consistency
 //!
@@ -28,8 +27,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
-use sqlx::PgPool;
+use sqlx::postgres::PgPool;
 
 use aura_core::error::{AuraError, AuraResult};
 
@@ -50,10 +50,9 @@ const UPSERT_SQL: &str = r#"
 ///
 /// One instance per `aura-store` process, shared across all writers.
 pub struct PvCache {
-    cache: HashMap<String, i32>,
+    cache: HashMap<Arc<str>, i32>,
     max_entries: usize,
 
-    // ── Statistics ───────────────────────────────────────────────────
     hits: u64,
     misses: u64,
     /// Times a resolve was rejected because the cache is full.
@@ -84,10 +83,6 @@ impl PvCache {
     }
 
     /// Resolve a PV name to its numeric ID.
-    ///
-    /// **Hot path** — called for every stored sample.
-    /// Cache hit: HashMap lookup, zero allocation.
-    /// Cache miss: DB upsert + cache insert.
     pub async fn resolve(&mut self, pv_name: &str, pool: &PgPool) -> AuraResult<i32> {
         // Fast path: cache hit (99.9% of calls).
         if let Some(&id) = self.cache.get(pv_name) {
@@ -105,7 +100,7 @@ impl PvCache {
         // Slow path: cache miss — upsert and cache.
         self.misses += 1;
         let id = self.upsert_pv_lookup(pv_name, pool).await?;
-        self.cache.insert(pv_name.to_string(), id);
+        self.cache.insert(Arc::from(pv_name), id);
         Ok(id)
     }
 
@@ -117,14 +112,7 @@ impl PvCache {
     }
 
     /// Resolve multiple PV names in bulk, returning (hits, misses).
-    ///
-    /// More efficient than calling `resolve()` in a loop when you
-    /// need to check many names — batches the DB lookups.
-    pub async fn resolve_bulk(
-        &mut self,
-        pv_names: &[&str],
-        pool: &PgPool,
-    ) -> AuraResult<Vec<i32>> {
+    pub async fn resolve_bulk(&mut self, pv_names: &[&str], pool: &PgPool) -> AuraResult<Vec<i32>> {
         let mut ids = Vec::with_capacity(pv_names.len());
 
         for &pv_name in pv_names {
@@ -141,15 +129,15 @@ impl PvCache {
     /// Returns the number of entries loaded.
     pub async fn warm(&mut self, pool: &PgPool) -> AuraResult<usize> {
         let rows = sqlx::query_as::<_, (i32, String)>(
-            "SELECT pv_id, pv_name FROM pv_lookup ORDER BY pv_id"
+            "SELECT pv_id, pv_name FROM pv_lookup ORDER BY pv_id",
         )
-            .fetch_all(pool)
-            .await
-            .map_err(|e| AuraError::database(format!("pv_lookup warm failed: {e}")))?;
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AuraError::database(format!("pv_lookup warm failed: {e}")))?;
 
         let count = rows.len().min(self.max_entries);
         for (id, name) in rows.into_iter().take(self.max_entries) {
-            self.cache.insert(name, id);
+            self.cache.insert(Arc::from(&*name), id);
         }
 
         tracing::info!(entries = count, "PV cache warmed");
@@ -161,29 +149,40 @@ impl PvCache {
         if self.cache.len() >= self.max_entries {
             return false;
         }
-        self.cache.insert(pv_name.into(), pv_id);
+        let s: String = pv_name.into();
+        self.cache.insert(Arc::from(&*s), pv_id);
         true
     }
 
     /// Number of PVs in the cache.
     #[inline]
-    pub fn len(&self) -> usize { self.cache.len() }
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
 
     /// Whether the cache is empty.
     #[inline]
-    pub fn is_empty(&self) -> bool { self.cache.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
 
     /// Whether the cache has reached its maximum size.
     #[inline]
-    pub fn is_full(&self) -> bool { self.cache.len() >= self.max_entries }
+    pub fn is_full(&self) -> bool {
+        self.cache.len() >= self.max_entries
+    }
 
     /// Maximum entries allowed.
     #[inline]
-    pub fn max_entries(&self) -> usize { self.max_entries }
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
 
     /// Cache utilization (0.0 to 1.0).
     pub fn utilization(&self) -> f64 {
-        if self.max_entries == 0 { return 0.0; }
+        if self.max_entries == 0 {
+            return 0.0;
+        }
         self.cache.len() as f64 / self.max_entries as f64
     }
 
@@ -194,21 +193,35 @@ impl PvCache {
     }
 
     /// Total cache hits.
-    #[inline] pub fn hits(&self) -> u64 { self.hits }
+    #[inline]
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
 
     /// Total cache misses (DB lookups).
-    #[inline] pub fn misses(&self) -> u64 { self.misses }
+    #[inline]
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
 
     /// Total lookups (hits + misses).
-    #[inline] pub fn total_lookups(&self) -> u64 { self.hits + self.misses }
+    #[inline]
+    pub fn total_lookups(&self) -> u64 {
+        self.hits + self.misses
+    }
 
     /// Times resolve was called when the cache was full.
-    #[inline] pub fn saturations(&self) -> u64 { self.saturations }
+    #[inline]
+    pub fn saturations(&self) -> u64 {
+        self.saturations
+    }
 
     /// Cache hit ratio (0.0 to 1.0). Returns 1.0 if no lookups.
     pub fn hit_ratio(&self) -> f64 {
         let total = self.hits + self.misses;
-        if total == 0 { return 1.0; }
+        if total == 0 {
+            return 1.0;
+        }
         self.hits as f64 / total as f64
     }
 
@@ -229,32 +242,82 @@ impl PvCache {
 
     /// Iterate over all cached (pv_name, pv_id) pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&str, i32)> {
-        self.cache.iter().map(|(k, &v)| (k.as_str(), v))
+        self.cache.iter().map(|(k, &v)| (&**k, v))
     }
 
-    /// Insert the PV name into `pv_lookup` if it doesn't exist,
-    /// then return the pv_id.
+    /// Insert the PV name into `pv_lookup` if it doesn't exist, then return the pv_id.
+    /// Bulk-insert PV names into `pv_lookup` and warm the cache.
+    /// Call at startup after monitors are connected, before processing events.
+    /// Uses a single INSERT ... ON CONFLICT for all PVs → ~100ms for 30k PVs.
+    pub async fn bulk_upsert(&mut self, pv_names: &[String], pool: &PgPool) -> AuraResult<usize> {
+        if pv_names.is_empty() {
+            return Ok(0);
+        }
+
+        // Single bulk INSERT with UNNEST — all PVs in one SQL round-trip.
+        let names: Vec<&str> = pv_names.iter().map(|s| s.as_str()).collect();
+        sqlx::query(
+            "INSERT INTO pv_lookup (pv_name) \
+             SELECT unnest($1::text[]) \
+             ON CONFLICT (pv_name) DO NOTHING",
+        )
+        .bind(&names)
+        .execute(pool)
+        .await
+        .map_err(|e| AuraError::database(format!("bulk pv_lookup insert: {e}")))?;
+
+        // Now load all IDs into the cache.
+        let rows = sqlx::query_as::<_, (i32, String)>(
+            "SELECT id, pv_name FROM pv_lookup WHERE pv_name = ANY($1::text[])",
+        )
+        .bind(&names)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| AuraError::database(format!("bulk pv_lookup fetch: {e}")))?;
+
+        let mut count = 0;
+        for (id, name) in rows {
+            if self.cache.len() < self.max_entries {
+                self.cache.insert(Arc::from(&*name), id);
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
     async fn upsert_pv_lookup(&self, pv_name: &str, pool: &PgPool) -> AuraResult<i32> {
         sqlx::query_scalar::<_, i32>(UPSERT_SQL)
             .bind(pv_name)
             .fetch_one(pool)
             .await
-            .map_err(|e| AuraError::database(
-                format!("pv_lookup upsert failed for '{}': {}", pv_name, e)
-            ))
+            .map_err(|e| {
+                AuraError::database(format!("pv_lookup upsert failed for '{}': {}", pv_name, e))
+            })
     }
 }
 
 impl Default for PvCache {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl fmt::Debug for PvCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PvCache")
-            .field("entries", &format!("{}/{}", self.cache.len(), self.max_entries))
-            .field("utilization", &format!("{:.1}%", self.utilization() * 100.0))
-            .field("mem", &format!("{:.1} KB", self.mem_bytes() as f64 / 1024.0))
+            .field(
+                "entries",
+                &format!("{}/{}", self.cache.len(), self.max_entries),
+            )
+            .field(
+                "utilization",
+                &format!("{:.1}%", self.utilization() * 100.0),
+            )
+            .field(
+                "mem",
+                &format!("{:.1} KB", self.mem_bytes() as f64 / 1024.0),
+            )
             .field("hits", &self.hits)
             .field("misses", &self.misses)
             .field("hit_ratio", &format!("{:.2}%", self.hit_ratio() * 100.0))
@@ -269,10 +332,13 @@ impl fmt::Display for PvCache {
             f,
             "PvCache: {}/{} entries ({:.1}%, {:.1} KB), \
              hit_ratio={:.2}% ({} hits, {} misses), {} saturations",
-            self.cache.len(), self.max_entries,
+            self.cache.len(),
+            self.max_entries,
             self.utilization() * 100.0,
             self.mem_bytes() as f64 / 1024.0,
-            self.hit_ratio() * 100.0, self.hits, self.misses,
+            self.hit_ratio() * 100.0,
+            self.hits,
+            self.misses,
             self.saturations,
         )
     }
@@ -281,10 +347,6 @@ impl fmt::Display for PvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ═════════════════════════════════════════════════════════════════
-    // Construction
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_new() {
@@ -328,10 +390,6 @@ mod tests {
         assert_eq!(c.max_entries(), DEFAULT_MAX_ENTRIES);
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // resolve_cached (local only)
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_resolve_cached_empty() {
         assert_eq!(PvCache::new().resolve_cached("PV:A"), None);
@@ -365,10 +423,6 @@ mod tests {
         assert_eq!(c.len(), 3);
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // insert (manual population)
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_insert() {
         let mut c = PvCache::new();
@@ -395,10 +449,6 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert!(c.is_full());
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // Hit/miss counters
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_hit_ratio_no_lookups() {
@@ -434,10 +484,6 @@ mod tests {
         c.misses = 10;
         assert_eq!(c.total_lookups(), 100);
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // Utilization & memory
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_utilization_empty() {
@@ -480,10 +526,6 @@ mod tests {
         assert_eq!(c.mem_bytes(), 100 * 90);
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // reset_stats / clear
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_reset_stats() {
         let mut c = PvCache::new();
@@ -520,10 +562,6 @@ mod tests {
         assert_eq!(c.resolve_cached("PV:A"), None);
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // iter
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_iter_empty() {
         assert_eq!(PvCache::new().iter().count(), 0);
@@ -540,10 +578,6 @@ mod tests {
         assert_eq!(pairs, vec![("PV:A", 1), ("PV:B", 2)]);
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // SQL constant
-    // ═════════════════════════════════════════════════════════════════
-
     #[test]
     fn test_upsert_sql_has_returning() {
         assert!(UPSERT_SQL.to_uppercase().contains("RETURNING PV_ID"));
@@ -559,10 +593,6 @@ mod tests {
         // DO UPDATE (not DO NOTHING) ensures RETURNING always works.
         assert!(UPSERT_SQL.to_uppercase().contains("DO UPDATE"));
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // Hot path simulation (no DB)
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_simulated_hot_path() {
@@ -604,10 +634,6 @@ mod tests {
         assert_eq!(c.resolve_cached("PV:D"), None);
         // The saturation counter would be incremented by resolve().
     }
-
-    // ═════════════════════════════════════════════════════════════════
-    // Display / Debug
-    // ═════════════════════════════════════════════════════════════════
 
     #[test]
     fn test_display() {
