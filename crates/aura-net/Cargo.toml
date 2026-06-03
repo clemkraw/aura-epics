@@ -2,7 +2,19 @@
 name = "aura-net"
 version = "0.1.0"
 edition = "2024"
-description = "Pure Rust PVAccess (PVXS) protocol implementation for EPICS 7"
+description = "Pure Rust PVAccess protocol client implementation for EPICS 7 control systems"
 license = "MIT"
 
 [dependencies]
+aura-core = { path = "../aura-core" }
+tracing = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+crossbeam-channel = { workspace = true }
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
