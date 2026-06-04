@@ -9,7 +9,6 @@ pub mod pv;
 pub mod pva;
 pub mod sample;
 pub mod telemetry;
-pub mod shard;
 pub mod alert;
 
 pub use config::AuraConfig;
@@ -26,6 +25,5 @@ pub use pva::{
     NormativeType, PvDataType, ScalarType, ScalarValue,
     TableColumn, TimeStamp, UnionValue, ValueAlarm,
 };
-pub use sample::{FilterDecision, PvUpdate, StoreReason};
-pub use shard::ShardAssigner;
+pub use sample::{PvUpdate, StoreReason};
 pub use alert::AlertLevel;
