@@ -2,10 +2,16 @@
 name = "aura-discover"
 version = "0.1.0"
 edition = "2024"
-description = "AURA IOC discovery, PV registry management, and auto-sharding"
-license = "Apache-2.0"
+description = "AURA PV discovery: config polling, reconciliation, subscribe/unsubscribe commands"
+license = "MIT"
 
 [dependencies]
 aura-core = { path = "../aura-core" }
-aura-net = { path = "../aura-net" }
 aura-store = { path = "../aura-store" }
+tokio = { workspace = true }
+redis = { workspace = true }
+sqlx = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
