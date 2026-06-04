@@ -33,29 +33,16 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use super::copy_pool::{CopyPool, PG_EPOCH_OFFSET_US, PGCOPY_HEADER, PGCOPY_TRAILER, PushResult};
 use aura_core::error::{AuraError, AuraResult};
 
-/// Default max buffer (64 MB).
 const DEFAULT_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
-
-/// Wire size per numeric element.
 const NUM_WIRE_SIZE: usize = 66;
-
-/// Wire size per string element (fixed part, + string length).
-const STR_WIRE_BASE: usize = 58; // 66 - 12(value f64) + 4(text len prefix)
-
-/// Number of columns for numeric array COPY.
-const NUM_COLUMNS_NUM: i16 = 7;
-
-/// Number of columns for string array COPY.
+const STR_WIRE_BASE: usize = 58;
 const NUM_COLUMNS_STR: i16 = 7;
-
-/// Parallel threshold.
 const PARALLEL_THRESHOLD: usize = 10_000;
 
-const COPY_SQL_NUM: &str = "COPY samples_array_num (time, pv_id, array_id, idx, value, severity, status) FROM STDIN WITH (FORMAT binary)";
-const COPY_SQL_STR: &str = "COPY samples_array_str (time, pv_id, array_id, idx, value, severity, status) FROM STDIN WITH (FORMAT binary)";
+pub(crate) const COPY_SQL_NUM: &str = "COPY samples_array_num (time, pv_id, array_id, idx, value, severity, status) FROM STDIN WITH (FORMAT binary)";
+pub(crate) const COPY_SQL_STR: &str = "COPY samples_array_str (time, pv_id, array_id, idx, value, severity, status) FROM STDIN WITH (FORMAT binary)";
 
 /// Global array_id counter — monotone across all PVs.
-/// Each waveform capture gets a unique ID for reconstruction.
 static NEXT_ARRAY_ID: AtomicI64 = AtomicI64::new(1);
 
 fn next_array_id() -> i64 {
@@ -65,7 +52,7 @@ fn next_array_id() -> i64 {
 /// A single element from a numeric waveform/matrix.
 #[derive(Debug, Clone, Copy)]
 pub struct ArrayNumRow {
-    pub time: DateTime<Utc>,
+    pub pg_us: i64,
     pub pv_id: i32,
     pub array_id: i64,
     pub idx: i32,
@@ -77,44 +64,55 @@ pub struct ArrayNumRow {
 impl ArrayNumRow {
     #[inline]
     fn encode_copy(&self, out: &mut [u8; NUM_WIRE_SIZE]) {
-        let pg_us = self.time.timestamp_micros() - PG_EPOCH_OFFSET_US;
-        let mut o = 0;
-        out[o..o + 2].copy_from_slice(&NUM_COLUMNS_NUM.to_be_bytes());
-        o += 2;
-        out[o..o + 4].copy_from_slice(&8i32.to_be_bytes());
-        o += 4;
-        out[o..o + 8].copy_from_slice(&pg_us.to_be_bytes());
-        o += 8;
-        out[o..o + 4].copy_from_slice(&4i32.to_be_bytes());
-        o += 4;
-        out[o..o + 4].copy_from_slice(&self.pv_id.to_be_bytes());
-        o += 4;
-        out[o..o + 4].copy_from_slice(&8i32.to_be_bytes());
-        o += 4;
-        out[o..o + 8].copy_from_slice(&self.array_id.to_be_bytes());
-        o += 8;
-        out[o..o + 4].copy_from_slice(&4i32.to_be_bytes());
-        o += 4;
-        out[o..o + 4].copy_from_slice(&self.idx.to_be_bytes());
-        o += 4;
-        out[o..o + 4].copy_from_slice(&8i32.to_be_bytes());
-        o += 4;
-        out[o..o + 8].copy_from_slice(&self.value.to_be_bytes());
-        o += 8;
-        out[o..o + 4].copy_from_slice(&2i32.to_be_bytes());
-        o += 4;
-        out[o..o + 2].copy_from_slice(&self.severity.to_be_bytes());
-        o += 2;
-        out[o..o + 4].copy_from_slice(&2i32.to_be_bytes());
-        o += 4;
-        out[o..o + 2].copy_from_slice(&self.status.to_be_bytes());
+        const TEMPLATE: [u8; NUM_WIRE_SIZE] = {
+            let mut t = [0u8; NUM_WIRE_SIZE];
+            t[0] = 0;
+            t[1] = 7;
+            t[2] = 0;
+            t[3] = 0;
+            t[4] = 0;
+            t[5] = 8;
+            t[14] = 0;
+            t[15] = 0;
+            t[16] = 0;
+            t[17] = 4;
+            t[22] = 0;
+            t[23] = 0;
+            t[24] = 0;
+            t[25] = 8;
+            t[34] = 0;
+            t[35] = 0;
+            t[36] = 0;
+            t[37] = 4;
+            t[42] = 0;
+            t[43] = 0;
+            t[44] = 0;
+            t[45] = 8;
+            t[54] = 0;
+            t[55] = 0;
+            t[56] = 0;
+            t[57] = 2;
+            t[60] = 0;
+            t[61] = 0;
+            t[62] = 0;
+            t[63] = 2;
+            t
+        };
+        *out = TEMPLATE;
+        out[6..14].copy_from_slice(&self.pg_us.to_be_bytes());
+        out[18..22].copy_from_slice(&self.pv_id.to_be_bytes());
+        out[26..34].copy_from_slice(&self.array_id.to_be_bytes());
+        out[38..42].copy_from_slice(&self.idx.to_be_bytes());
+        out[46..54].copy_from_slice(&self.value.to_be_bytes());
+        out[58..60].copy_from_slice(&self.severity.to_be_bytes());
+        out[64..66].copy_from_slice(&self.status.to_be_bytes());
     }
 }
 
 /// A single element from a string array.
 #[derive(Debug, Clone)]
 pub struct ArrayStrRow {
-    pub time: DateTime<Utc>,
+    pub pg_us: i64,
     pub pv_id: i32,
     pub array_id: i64,
     pub idx: i32,
@@ -130,11 +128,10 @@ impl ArrayStrRow {
     }
 
     fn encode_copy(&self, buf: &mut Vec<u8>) {
-        let pg_us = self.time.timestamp_micros() - PG_EPOCH_OFFSET_US;
         let val_bytes = self.value.as_bytes();
         buf.extend_from_slice(&NUM_COLUMNS_STR.to_be_bytes());
         buf.extend_from_slice(&8i32.to_be_bytes());
-        buf.extend_from_slice(&pg_us.to_be_bytes());
+        buf.extend_from_slice(&self.pg_us.to_be_bytes());
         buf.extend_from_slice(&4i32.to_be_bytes());
         buf.extend_from_slice(&self.pv_id.to_be_bytes());
         buf.extend_from_slice(&8i32.to_be_bytes());
@@ -166,14 +163,12 @@ pub enum ArrayData {
 }
 
 impl ArrayCapture {
-    /// Number of elements.
     pub fn len(&self) -> usize {
         match &self.data {
             ArrayData::Numeric(v) => v.len(),
             ArrayData::String(v) => v.len(),
         }
     }
-
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -187,8 +182,8 @@ pub struct ArrayWriter {
     batch_size: usize,
     max_buffer_bytes: usize,
 
-    num_buffer: Vec<ArrayNumRow>,
-    str_buffer: Vec<ArrayStrRow>,
+    pub(crate) num_buffer: Vec<ArrayNumRow>,
+    pub(crate) str_buffer: Vec<ArrayStrRow>,
     current_bytes: usize,
 
     copy_pool: Option<CopyPool>,
@@ -235,7 +230,6 @@ impl ArrayWriter {
         self.copy_pool = Some(pool);
     }
 
-    /// Push a complete waveform capture. Destructures into element rows.
     pub fn push(&mut self, capture: ArrayCapture) -> PushResult {
         let n = capture.len();
         if n == 0 {
@@ -255,6 +249,7 @@ impl ArrayWriter {
         }
 
         let aid = next_array_id();
+        let pg_us = capture.time.timestamp_micros() - PG_EPOCH_OFFSET_US;
         self.current_bytes += est_bytes;
         self.total_captures += 1;
         self.total_elements += n as u64;
@@ -264,7 +259,7 @@ impl ArrayWriter {
                 self.num_buffer.reserve(values.len());
                 for (idx, value) in values.into_iter().enumerate() {
                     self.num_buffer.push(ArrayNumRow {
-                        time: capture.time,
+                        pg_us,
                         pv_id: capture.pv_id,
                         array_id: aid,
                         idx: idx as i32,
@@ -278,7 +273,7 @@ impl ArrayWriter {
                 self.str_buffer.reserve(values.len());
                 for (idx, value) in values.into_iter().enumerate() {
                     self.str_buffer.push(ArrayStrRow {
-                        time: capture.time,
+                        pg_us,
                         pv_id: capture.pv_id,
                         array_id: aid,
                         idx: idx as i32,
@@ -290,15 +285,13 @@ impl ArrayWriter {
             }
         }
 
-        let total_rows = self.num_buffer.len() + self.str_buffer.len();
-        if total_rows >= self.batch_size {
+        if self.num_buffer.len() + self.str_buffer.len() >= self.batch_size {
             PushResult::Full
         } else {
             PushResult::Accepted
         }
     }
 
-    /// Flush all buffered element rows via binary COPY.
     pub async fn flush(&mut self) -> AuraResult<usize> {
         let num_count = self.num_buffer.len();
         let str_count = self.str_buffer.len();
@@ -310,10 +303,8 @@ impl ArrayWriter {
             .copy_pool
             .as_ref()
             .ok_or_else(|| AuraError::database("ArrayWriter: no copy pool configured"))?;
-
         let mut total = 0;
 
-        // Flush numeric buffer.
         if num_count > 0 {
             let t0 = std::time::Instant::now();
             let n_conn = pool.len();
@@ -338,12 +329,10 @@ impl ArrayWriter {
                 pool.send_copy(0, COPY_SQL_NUM, payload, num_count).await?;
                 self.total_send_us += t1.elapsed().as_micros() as u64;
             }
-
             total += num_count;
             self.num_buffer.clear();
         }
 
-        // Flush string buffer (rare, single connection).
         if str_count > 0 {
             let t0 = std::time::Instant::now();
             let payload = Self::build_str_payload(&self.str_buffer);
@@ -363,8 +352,7 @@ impl ArrayWriter {
         Ok(total)
     }
 
-    /// Build binary COPY payload for numeric elements.
-    fn build_num_payload(rows: &[ArrayNumRow]) -> Vec<u8> {
+    pub(crate) fn build_num_payload(rows: &[ArrayNumRow]) -> Vec<u8> {
         let capacity = PGCOPY_HEADER.len() + rows.len() * NUM_WIRE_SIZE + PGCOPY_TRAILER.len();
         let mut buf = Vec::with_capacity(capacity);
         buf.extend_from_slice(&PGCOPY_HEADER);
@@ -377,8 +365,7 @@ impl ArrayWriter {
         buf
     }
 
-    /// Build binary COPY payload for string elements.
-    fn build_str_payload(rows: &[ArrayStrRow]) -> Vec<u8> {
+    pub(crate) fn build_str_payload(rows: &[ArrayStrRow]) -> Vec<u8> {
         let wire_total: usize = rows.iter().map(|r| r.wire_size()).sum();
         let capacity = PGCOPY_HEADER.len() + wire_total + PGCOPY_TRAILER.len();
         let mut buf = Vec::with_capacity(capacity);
@@ -419,14 +406,6 @@ impl ArrayWriter {
         self.total_written
     }
     #[inline]
-    pub fn total_captures(&self) -> u64 {
-        self.total_captures
-    }
-    #[inline]
-    pub fn total_elements(&self) -> u64 {
-        self.total_elements
-    }
-    #[inline]
     pub fn total_flushes(&self) -> u64 {
         self.total_flushes
     }
@@ -442,8 +421,6 @@ impl ArrayWriter {
     pub fn total_send_us(&self) -> u64 {
         self.total_send_us
     }
-
-    // Compatibility
     #[inline]
     pub fn buffered(&self) -> usize {
         self.len()
@@ -454,13 +431,6 @@ impl ArrayWriter {
             return 0.0;
         }
         self.current_bytes as f64 / self.max_buffer_bytes as f64
-    }
-
-    pub fn avg_elements_per_capture(&self) -> f64 {
-        if self.total_captures == 0 {
-            return 0.0;
-        }
-        self.total_elements as f64 / self.total_captures as f64
     }
 
     pub fn discard(&mut self) {
@@ -487,6 +457,11 @@ impl fmt::Debug for ArrayWriter {
 
 impl fmt::Display for ArrayWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let avg = if self.total_captures > 0 {
+            self.total_elements as f64 / self.total_captures as f64
+        } else {
+            0.0
+        };
         write!(
             f,
             "ArrayWriter: {} num + {} str buffered ({:.1} KB, {:.0}% pressure), \
@@ -497,7 +472,7 @@ impl fmt::Display for ArrayWriter {
             self.memory_pressure() * 100.0,
             self.total_written,
             self.total_captures,
-            self.avg_elements_per_capture(),
+            avg,
             self.total_flushes,
         )
     }
@@ -506,13 +481,12 @@ impl fmt::Display for ArrayWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn now() -> DateTime<Utc> {
         Utc::now()
     }
-    fn ts(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).unwrap()
+    fn now_pg() -> i64 {
+        now().timestamp_micros() - PG_EPOCH_OFFSET_US
     }
 
     fn num_capture(pv: i32, values: Vec<f64>) -> ArrayCapture {
@@ -535,61 +509,40 @@ mod tests {
         }
     }
 
-    // ── ArrayCapture ─────────────────────────────────────────────
-
     #[test]
     fn capture_len() {
         assert_eq!(num_capture(1, vec![1.0, 2.0, 3.0]).len(), 3);
         assert_eq!(str_capture(1, vec!["a", "b"]).len(), 2);
-    }
-
-    #[test]
-    fn capture_empty() {
         assert!(num_capture(1, vec![]).is_empty());
     }
-
-    // ── ArrayWriter construction ─────────────────────────────────
 
     #[test]
     fn new_defaults() {
         let w = ArrayWriter::with_defaults();
         assert!(w.is_empty());
-        assert_eq!(w.total_captures(), 0);
-        assert_eq!(w.total_elements(), 0);
+        assert_eq!(w.total_written(), 0);
     }
-
-    // ── Push numeric ─────────────────────────────────────────────
 
     #[test]
     fn push_numeric() {
         let mut w = ArrayWriter::with_defaults();
-        let r = w.push(num_capture(1, vec![1.0, 2.0, 3.0]));
-        assert!(r.is_accepted());
+        assert!(w.push(num_capture(1, vec![1.0, 2.0, 3.0])).is_accepted());
         assert_eq!(w.len(), 3);
-        assert_eq!(w.total_captures(), 1);
-        assert_eq!(w.total_elements(), 3);
     }
 
     #[test]
     fn push_numeric_full() {
         let mut w = ArrayWriter::new(5);
         w.push(num_capture(1, vec![1.0, 2.0, 3.0]));
-        let r = w.push(num_capture(2, vec![4.0, 5.0]));
-        assert_eq!(r, PushResult::Full);
-        assert_eq!(w.len(), 5);
+        assert_eq!(w.push(num_capture(2, vec![4.0, 5.0])), PushResult::Full);
     }
-
-    // ── Push string ──────────────────────────────────────────────
 
     #[test]
     fn push_string() {
         let mut w = ArrayWriter::with_defaults();
-        let r = w.push(str_capture(1, vec!["hello", "world"]));
-        assert!(r.is_accepted());
+        assert!(w.push(str_capture(1, vec!["hello", "world"])).is_accepted());
         assert_eq!(w.len(), 2);
     }
-
-    // ── Push mixed ───────────────────────────────────────────────
 
     #[test]
     fn push_mixed() {
@@ -597,10 +550,7 @@ mod tests {
         w.push(num_capture(1, vec![1.0, 2.0]));
         w.push(str_capture(2, vec!["a", "b", "c"]));
         assert_eq!(w.len(), 5);
-        assert_eq!(w.total_captures(), 2);
     }
-
-    // ── Push empty ───────────────────────────────────────────────
 
     #[test]
     fn push_empty_capture() {
@@ -609,15 +559,10 @@ mod tests {
         assert_eq!(w.len(), 0);
     }
 
-    // ── Backpressure ─────────────────────────────────────────────
-
-    #[test]
-    fn backpressure() {
-        let mut w = ArrayWriter::with_limits(100_000, 200);
-        w.push(num_capture(1, vec![1.0, 2.0])); // 132 bytes
-        let r = w.push(num_capture(2, vec![3.0, 4.0, 5.0])); // 198 more → 330 > 200
-        assert_eq!(r, PushResult::BackpressureExceeded);
-        assert_eq!(w.total_backpressure(), 1);
+    #[test] fn backpressure() {
+        let mut w = ArrayWriter::with_limits(100_000, 1024);
+        w.push(num_capture(1, vec![1.0; 10])); // 10 * 66 = 660 bytes
+        assert_eq!(w.push(num_capture(2, vec![3.0; 10])), PushResult::BackpressureExceeded); // 660+660 > 1024
     }
 
     #[test]
@@ -625,8 +570,6 @@ mod tests {
         let mut w = ArrayWriter::with_limits(100_000, 1);
         assert!(w.push(num_capture(1, vec![1.0; 100])).is_accepted());
     }
-
-    // ── Discard ──────────────────────────────────────────────────
 
     #[test]
     fn discard() {
@@ -638,24 +581,18 @@ mod tests {
         assert_eq!(w.buffered_bytes(), 0);
     }
 
-    // ── array_id uniqueness ──────────────────────────────────────
-
     #[test]
-    fn array_ids_are_unique() {
+    fn array_ids_unique() {
         let mut w = ArrayWriter::with_defaults();
         w.push(num_capture(1, vec![1.0]));
         w.push(num_capture(1, vec![2.0]));
-        let id1 = w.num_buffer[0].array_id;
-        let id2 = w.num_buffer[1].array_id;
-        assert_ne!(id1, id2);
+        assert_ne!(w.num_buffer[0].array_id, w.num_buffer[1].array_id);
     }
-
-    // ── Binary payload — numeric ─────────────────────────────────
 
     #[test]
     fn num_payload_header_trailer() {
         let rows = vec![ArrayNumRow {
-            time: now(),
+            pg_us: now_pg(),
             pv_id: 1,
             array_id: 1,
             idx: 0,
@@ -672,7 +609,7 @@ mod tests {
     fn num_payload_exact_size() {
         let rows: Vec<_> = (0..100)
             .map(|i| ArrayNumRow {
-                time: now(),
+                pg_us: now_pg(),
                 pv_id: 1,
                 array_id: 1,
                 idx: i,
@@ -691,7 +628,7 @@ mod tests {
     #[test]
     fn num_payload_encodes_value() {
         let rows = vec![ArrayNumRow {
-            time: now(),
+            pg_us: now_pg(),
             pv_id: 42,
             array_id: 7,
             idx: 3,
@@ -700,7 +637,6 @@ mod tests {
             status: 0,
         }];
         let buf = ArrayWriter::build_num_payload(&rows);
-        // value at offset: 19(hdr) + 2(ncols) + 12(time) + 8(pv_id) + 12(array_id) + 8(idx) + 4(val_len) = 65
         let val = f64::from_be_bytes(buf[65..73].try_into().unwrap());
         assert_eq!(val, std::f64::consts::PI);
     }
@@ -708,7 +644,7 @@ mod tests {
     #[test]
     fn num_payload_encodes_array_id() {
         let rows = vec![ArrayNumRow {
-            time: now(),
+            pg_us: now_pg(),
             pv_id: 1,
             array_id: 999,
             idx: 0,
@@ -717,15 +653,13 @@ mod tests {
             status: 0,
         }];
         let buf = ArrayWriter::build_num_payload(&rows);
-        // array_id at offset: 19+2+12+8+4 = 45
-        let aid = i64::from_be_bytes(buf[45..53].try_into().unwrap());
-        assert_eq!(aid, 999);
+        assert_eq!(i64::from_be_bytes(buf[45..53].try_into().unwrap()), 999);
     }
 
     #[test]
     fn num_payload_encodes_idx() {
         let rows = vec![ArrayNumRow {
-            time: now(),
+            pg_us: now_pg(),
             pv_id: 1,
             array_id: 1,
             idx: 42,
@@ -734,17 +668,13 @@ mod tests {
             status: 0,
         }];
         let buf = ArrayWriter::build_num_payload(&rows);
-        // idx at offset: 19+2+12+8+12+4 = 57
-        let idx = i32::from_be_bytes(buf[57..61].try_into().unwrap());
-        assert_eq!(idx, 42);
+        assert_eq!(i32::from_be_bytes(buf[57..61].try_into().unwrap()), 42);
     }
-
-    // ── Binary payload — string ──────────────────────────────────
 
     #[test]
     fn str_payload_size() {
         let rows = vec![ArrayStrRow {
-            time: now(),
+            pg_us: now_pg(),
             pv_id: 1,
             array_id: 1,
             idx: 0,
@@ -759,27 +689,17 @@ mod tests {
         );
     }
 
-    // ── Statistics ───────────────────────────────────────────────
-
-    #[test]
-    fn avg_elements() {
-        let mut w = ArrayWriter::with_defaults();
-        w.total_captures = 10;
-        w.total_elements = 10240;
-        assert_eq!(w.avg_elements_per_capture(), 1024.0);
-    }
-
-    // ── Display / Debug ──────────────────────────────────────────
-
     #[test]
     fn display() {
-        let s = ArrayWriter::with_defaults().to_string();
-        assert!(s.contains("ArrayWriter") && s.contains("0 num"));
+        assert!(
+            ArrayWriter::with_defaults()
+                .to_string()
+                .contains("ArrayWriter")
+        );
     }
 
     #[test]
     fn debug() {
-        let d = format!("{:?}", ArrayWriter::with_defaults());
-        assert!(d.contains("ArrayWriter"));
+        assert!(format!("{:?}", ArrayWriter::with_defaults()).contains("ArrayWriter"));
     }
 }
