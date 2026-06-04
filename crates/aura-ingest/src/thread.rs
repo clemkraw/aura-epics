@@ -3,31 +3,24 @@
 //! and pushes WriterRows to the SharedBuffer.
 
 use crate::engine::IngestEngine;
+use crate::metrics::IngestMetrics;
 use aura_core::config::AuraConfig;
 use std::collections::HashMap;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::{Arc, Mutex, atomic::Ordering};
 
 /// Run one ingest shard: drain events from bus, decode, push to SharedBuffer.
 pub fn run_ingest_shard(
-    cfg: AuraConfig,
     pv_names: Vec<String>,
     mut shard_rx: aura_net::monitor::bus::MonitorBusRx,
     shared_buf: Arc<aura_store::writer::shared_buf::SharedBuffer>,
     pv_cache: Arc<arc_swap::ArcSwap<HashMap<Arc<str>, i32>>>,
     meta_store: Arc<Mutex<Vec<aura_core::metadata::PvMetadata>>>,
     stats_sink: Arc<Mutex<Vec<HashMap<i32, (u64, f64, i16)>>>>,
-    stat_events: Arc<AtomicU64>,
-    stat_published: Arc<AtomicU64>,
-    stat_fast_path: Arc<AtomicU64>,
-    stat_full_decode: Arc<AtomicU64>,
-    stat_skipped: Arc<AtomicU64>,
+    metrics: Arc<IngestMetrics>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     heartbeat_config: Arc<arc_swap::ArcSwap<Vec<(i32, f32)>>>,
+    default_heartbeat_s: f64,
 ) {
-    let default_heartbeat_s = cfg.ingest.default_heartbeat_s;
     let mut engine = IngestEngine::new();
     for name in &pv_names {
         engine.register_pv(name);
@@ -47,10 +40,10 @@ pub fn run_ingest_shard(
             return;
         }
 
-        let mut local_se = 0u64;
-        let mut local_sp = 0u64;
-        let mut local_sfp = 0u64;
-        let mut local_sfd = 0u64;
+        let mut local_events = 0u64;
+        let mut local_published = 0u64;
+        let mut local_fast = 0u64;
+        let mut local_slow = 0u64;
 
         event_buf.clear();
         shard_rx.drain_into(&mut event_buf, 65536);
@@ -95,9 +88,9 @@ pub fn run_ingest_shard(
                     e.2 = *severity as i16;
                 }
                 heartbeat.record_store(pv_id, *value, *severity as i16, *status as i16, batch_now);
-                local_se += 1;
-                local_sp += 1;
-                local_sfp += 1;
+                local_events += 1;
+                local_published += 1;
+                local_fast += 1;
                 continue;
             }
 
@@ -127,9 +120,9 @@ pub fn run_ingest_shard(
                         *status as i16,
                     ),
                 ));
-                local_se += 1;
-                local_sp += 1;
-                local_sfp += 1;
+                local_events += 1;
+                local_published += 1;
+                local_fast += 1;
                 continue;
             }
 
@@ -167,14 +160,14 @@ pub fn run_ingest_shard(
                             data: aura_store::writer::array::ArrayData::Numeric(values),
                         }),
                     ));
-                    local_se += 1;
-                    local_sp += 1;
-                    local_sfp += 1;
+                    local_events += 1;
+                    local_published += 1;
+                    local_fast += 1;
                 }
 
-                // Slow path - all other types go through converter.
+                // Slow path — all other types go through converter.
                 slow_ev => {
-                    local_sfd += 1;
+                    local_slow += 1;
                     if let crate::engine::ProcessResult::Sample(mut update) =
                         engine.process_event(&tag_pv, slow_ev)
                     {
@@ -313,18 +306,24 @@ pub fn run_ingest_shard(
                                 }
                             }
                         }
-                        local_sp += 1;
+                        local_published += 1;
                     }
                 }
             }
         }
 
-        // Batch atomic flush.
-        stat_events.fetch_add(engine.total_events + local_se, Ordering::Relaxed);
-        stat_published.fetch_add(engine.total_published + local_sp, Ordering::Relaxed);
-        stat_fast_path.fetch_add(local_sfp, Ordering::Relaxed);
-        stat_full_decode.fetch_add(local_sfd, Ordering::Relaxed);
-        stat_skipped.fetch_add(engine.total_skipped, Ordering::Relaxed);
+        // Batch atomic flush — one load per counter per batch, not per event.
+        metrics
+            .events_received
+            .fetch_add(engine.total_events + local_events, Ordering::Relaxed);
+        metrics
+            .events_published
+            .fetch_add(engine.total_published + local_published, Ordering::Relaxed);
+        metrics.fast_path.fetch_add(local_fast, Ordering::Relaxed);
+        metrics.slow_path.fetch_add(local_slow, Ordering::Relaxed);
+        metrics
+            .events_skipped
+            .fetch_add(engine.total_skipped, Ordering::Relaxed);
         engine.total_events = 0;
         engine.total_published = 0;
         engine.total_skipped = 0;
@@ -362,12 +361,14 @@ pub fn run_ingest_shard(
                 pv_cache.load().values().copied().collect();
             let hb_count = heartbeat.emit_heartbeats(&shared_buf, &active_ids);
             if hb_count > 0 {
-                local_sp += hb_count as u64;
+                metrics
+                    .events_published
+                    .fetch_add(hb_count as u64, Ordering::Relaxed);
             }
             last_heartbeat_scan = std::time::Instant::now();
         }
 
-        if local_se == 0 && local_sfd == 0 {
+        if local_events == 0 && local_slow == 0 {
             idle_count += 1;
             if shutdown.load(Ordering::Relaxed) {
                 return;
@@ -391,11 +392,7 @@ pub struct IngestContext {
     pub shared_pv_cache: Arc<arc_swap::ArcSwap<HashMap<Arc<str>, i32>>>,
     pub inline_meta_store: Arc<Mutex<Vec<aura_core::metadata::PvMetadata>>>,
     pub pv_stats_sink: Arc<Mutex<Vec<HashMap<i32, (u64, f64, i16)>>>>,
-    pub stat_events: Arc<AtomicU64>,
-    pub stat_published: Arc<AtomicU64>,
-    pub stat_fast_path: Arc<AtomicU64>,
-    pub stat_full_decode: Arc<AtomicU64>,
-    pub stat_skipped: Arc<AtomicU64>,
+    pub metrics: Arc<IngestMetrics>,
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
     pub heartbeat_config: Arc<arc_swap::ArcSwap<Vec<(i32, f32)>>>,
 }
@@ -408,7 +405,6 @@ pub fn spawn_ingest_threads(
 ) -> Vec<std::thread::JoinHandle<()>> {
     let mut handles = Vec::new();
     for shard_id in 0..ctx.ingest_threads {
-        let cfg = ctx.config.clone();
         let pv_names = shard_pvs.remove(0);
         let n_pvs = pv_names.len();
         let shard_rx = bus_rxs.remove(0);
@@ -416,32 +412,25 @@ pub fn spawn_ingest_threads(
         let pv_cache = ctx.shared_pv_cache.clone();
         let meta_store = ctx.inline_meta_store.clone();
         let stats_sink = ctx.pv_stats_sink.clone();
-        let se = ctx.stat_events.clone();
-        let sp = ctx.stat_published.clone();
-        let sfp = ctx.stat_fast_path.clone();
-        let sfd = ctx.stat_full_decode.clone();
-        let ss = ctx.stat_skipped.clone();
+        let metrics = ctx.metrics.clone();
         let shutdown = ctx.shutdown.clone();
         let heartbeat_config = ctx.heartbeat_config.clone();
+        let default_heartbeat_s = ctx.config.ingest.default_heartbeat_s;
 
         let handle = std::thread::Builder::new()
             .name(format!("ingest-{shard_id}"))
             .spawn(move || {
                 run_ingest_shard(
-                    cfg,
                     pv_names,
                     shard_rx,
                     shared_buf,
                     pv_cache,
                     meta_store,
                     stats_sink,
-                    se,
-                    sp,
-                    sfp,
-                    sfd,
-                    ss,
+                    metrics,
                     shutdown,
                     heartbeat_config,
+                    default_heartbeat_s,
                 )
             })
             .expect("failed to spawn ingest thread");
