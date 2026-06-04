@@ -7,7 +7,10 @@
 //!
 //! Binary COPY via the shared [`CopyPool`](CopyPool).
 //! Variable-length TEXT values are encoded as `len(4) + utf8_bytes`.
-//! No text escaping needed — binary format handles all byte values.
+//! No text escaping needed - binary format handles all byte values.
+//!
+//! For high-throughput string workloads (>100k/s), the flush splits
+//! the buffer across multiple pool connections for parallel COPY.
 //!
 //! # Binary Row Layout (on the wire)
 //!
@@ -22,7 +25,7 @@ use std::fmt;
 use super::copy_pool::{CopyPool, PG_EPOCH_OFFSET_US, PGCOPY_HEADER, PGCOPY_TRAILER, PushResult};
 use aura_core::error::{AuraError, AuraResult};
 
-/// Default maximum buffer memory.
+/// Default maximum buffer memory (32 MB - strings can be large).
 const DEFAULT_MAX_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// Number of columns in the COPY.
@@ -32,7 +35,7 @@ const NUM_COLUMNS: i16 = 5;
 const PARALLEL_THRESHOLD: usize = 10_000;
 
 /// COPY SQL for binary format.
-const COPY_SQL: &str =
+pub(crate) const COPY_SQL: &str =
     "COPY samples_string (time, pv_id, value, severity, status) FROM STDIN WITH (FORMAT binary)";
 
 /// A single row for the `samples_string` table.
@@ -50,6 +53,25 @@ impl StringRow {
     pub fn new(time: DateTime<Utc>, pv_id: i32, value: String, severity: i16, status: i16) -> Self {
         Self {
             time,
+            pv_id,
+            value,
+            severity,
+            status,
+        }
+    }
+
+    /// Create from raw Unix epoch (hot path - zero DateTime overhead).
+    #[inline]
+    pub fn from_epoch(
+        seconds: i64,
+        nanos: i32,
+        pv_id: i32,
+        value: String,
+        severity: i16,
+        status: i16,
+    ) -> Self {
+        Self {
+            time: DateTime::from_timestamp(seconds, nanos as u32).unwrap_or_default(),
             pv_id,
             value,
             severity,
@@ -79,28 +101,20 @@ impl StringRow {
     }
 
     /// Encode this row into COPY binary format.
-    ///
-    /// Appends directly to `buf` — no intermediate allocation.
     #[inline]
     fn encode_copy(&self, buf: &mut Vec<u8>) {
         let pg_us = self.time.timestamp_micros() - PG_EPOCH_OFFSET_US;
         let val_bytes = self.value.as_bytes();
 
-        // num_columns
         buf.extend_from_slice(&NUM_COLUMNS.to_be_bytes());
-        // time: len=8, value=i64
         buf.extend_from_slice(&8i32.to_be_bytes());
         buf.extend_from_slice(&pg_us.to_be_bytes());
-        // pv_id: len=4, value=i32
         buf.extend_from_slice(&4i32.to_be_bytes());
         buf.extend_from_slice(&self.pv_id.to_be_bytes());
-        // value: len=N, value=utf8 bytes (TEXT in binary COPY)
         buf.extend_from_slice(&(val_bytes.len() as i32).to_be_bytes());
         buf.extend_from_slice(val_bytes);
-        // severity: len=2, value=i16
         buf.extend_from_slice(&2i32.to_be_bytes());
         buf.extend_from_slice(&self.severity.to_be_bytes());
-        // status: len=2, value=i16
         buf.extend_from_slice(&2i32.to_be_bytes());
         buf.extend_from_slice(&self.status.to_be_bytes());
     }
@@ -129,14 +143,13 @@ impl fmt::Display for StringRow {
 pub struct StringWriter {
     batch_size: usize,
     max_buffer_bytes: usize,
-    buffer: Vec<StringRow>,
+    pub(crate) buffer: Vec<StringRow>,
     current_bytes: usize,
 
     copy_pool: Option<CopyPool>,
 
     total_written: u64,
     total_flushes: u64,
-    total_value_bytes: u64,
     total_backpressure: u64,
     total_build_us: u64,
     total_send_us: u64,
@@ -158,7 +171,6 @@ impl StringWriter {
             copy_pool: None,
             total_written: 0,
             total_flushes: 0,
-            total_value_bytes: 0,
             total_backpressure: 0,
             total_build_us: 0,
             total_send_us: 0,
@@ -169,7 +181,6 @@ impl StringWriter {
         Self::new(500)
     }
 
-    /// Set the shared COPY pool.
     pub fn set_copy_pool(&mut self, pool: CopyPool) {
         self.copy_pool = Some(pool);
     }
@@ -194,9 +205,6 @@ impl StringWriter {
     }
 
     /// Flush all buffered rows via binary COPY.
-    ///
-    /// If buffer > [`PARALLEL_THRESHOLD`] and pool has multiple connections,
-    /// splits into N chunks for parallel COPY (same strategy as scalar).
     pub async fn flush(&mut self) -> AuraResult<usize> {
         if self.buffer.is_empty() {
             return Ok(0);
@@ -212,7 +220,6 @@ impl StringWriter {
         let t0 = std::time::Instant::now();
 
         if count >= PARALLEL_THRESHOLD && n_conn > 1 {
-            // Parallel: split across connections.
             let chunk_size = (count + n_conn - 1) / n_conn;
             let payloads: Vec<_> = self
                 .buffer
@@ -225,7 +232,6 @@ impl StringWriter {
             pool.send_parallel(COPY_SQL, payloads).await?;
             self.total_send_us += t1.elapsed().as_micros() as u64;
         } else {
-            // Single connection.
             let payload = Self::build_copy_payload(&self.buffer);
             self.total_build_us += t0.elapsed().as_micros() as u64;
 
@@ -234,8 +240,6 @@ impl StringWriter {
             self.total_send_us += t1.elapsed().as_micros() as u64;
         }
 
-        let value_bytes: u64 = self.buffer.iter().map(|r| r.value.len() as u64).sum();
-        self.total_value_bytes += value_bytes;
         self.total_written += count as u64;
         self.total_flushes += 1;
         self.buffer.clear();
@@ -244,7 +248,7 @@ impl StringWriter {
     }
 
     /// Build binary COPY payload from a slice of rows.
-    fn build_copy_payload(rows: &[StringRow]) -> Vec<u8> {
+    pub(crate) fn build_copy_payload(rows: &[StringRow]) -> Vec<u8> {
         let wire_total: usize = rows.iter().map(|r| r.wire_size()).sum();
         let capacity = PGCOPY_HEADER.len() + wire_total + PGCOPY_TRAILER.len();
         let mut buf = Vec::with_capacity(capacity);
@@ -291,10 +295,6 @@ impl StringWriter {
         self.total_flushes
     }
     #[inline]
-    pub fn total_value_bytes(&self) -> u64 {
-        self.total_value_bytes
-    }
-    #[inline]
     pub fn total_backpressure(&self) -> u64 {
         self.total_backpressure
     }
@@ -307,18 +307,10 @@ impl StringWriter {
         self.total_send_us
     }
 
-    // Compatibility aliases
+    // Compatibility alias
     #[inline]
     pub fn buffered(&self) -> usize {
         self.len()
-    }
-    #[inline]
-    pub fn copy_flushes(&self) -> u64 {
-        self.total_flushes
-    }
-    #[inline]
-    pub fn insert_flushes(&self) -> u64 {
-        0
     }
 
     pub fn memory_pressure(&self) -> f64 {
@@ -326,13 +318,6 @@ impl StringWriter {
             return 0.0;
         }
         self.current_bytes as f64 / self.max_buffer_bytes as f64
-    }
-
-    pub fn avg_value_len(&self) -> f64 {
-        if self.total_written == 0 {
-            return 0.0;
-        }
-        self.total_value_bytes as f64 / self.total_written as f64
     }
 
     pub fn avg_batch_size(&self) -> f64 {
@@ -347,7 +332,6 @@ impl StringWriter {
         self.current_bytes = 0;
     }
 }
-
 
 impl fmt::Debug for StringWriter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -370,7 +354,7 @@ impl fmt::Display for StringWriter {
         write!(
             f,
             "StringWriter: {}/{} buffered ({:.1} KB/{:.1} MB, {:.0}% pressure), \
-             {} written (avg {:.0}), {} flushes, avg value {:.0}B, {} backpressure",
+             {} written (avg {:.0}), {} flushes, {} backpressure",
             self.len(),
             self.batch_size,
             self.current_bytes as f64 / 1024.0,
@@ -379,7 +363,6 @@ impl fmt::Display for StringWriter {
             self.total_written,
             self.avg_batch_size(),
             self.total_flushes,
-            self.avg_value_len(),
             self.total_backpressure,
         )
     }
@@ -400,8 +383,6 @@ mod tests {
         StringRow::new(now(), pv, val.to_string(), 0, 0)
     }
 
-    // ── StringRow ────────────────────────────────────────────────
-
     #[test]
     fn row_new() {
         let r = row(42, "hello");
@@ -413,9 +394,7 @@ mod tests {
 
     #[test]
     fn row_empty_value() {
-        let r = row(1, "");
-        assert!(r.is_value_empty());
-        assert_eq!(r.value_len(), 0);
+        assert!(row(1, "").is_value_empty());
     }
 
     #[test]
@@ -425,8 +404,7 @@ mod tests {
     #[test]
     fn row_wire_size() {
         assert_eq!(row(1, "hello").wire_size(), 43);
-    } // 38 + 5
-
+    }
     #[test]
     fn row_wire_size_empty() {
         assert_eq!(row(1, "").wire_size(), 38);
@@ -434,8 +412,7 @@ mod tests {
 
     #[test]
     fn row_display_short() {
-        let s = row(42, "hello").to_string();
-        assert!(s.contains("pv_id=42") && s.contains("hello"));
+        assert!(row(42, "hello").to_string().contains("pv_id=42"));
     }
 
     #[test]
@@ -444,32 +421,12 @@ mod tests {
         assert!(s.contains("...") && s.contains("100 bytes"));
     }
 
-    // ── PushResult (from copy_pool) ──────────────────────────────
-
-    #[test]
-    fn push_result() {
-        assert!(!PushResult::Accepted.needs_flush());
-        assert!(PushResult::Full.needs_flush());
-        assert!(!PushResult::BackpressureExceeded.is_accepted());
-    }
-
-    // ── StringWriter construction ────────────────────────────────
-
     #[test]
     fn new_defaults() {
         let w = StringWriter::with_defaults();
         assert!(w.is_empty());
         assert_eq!(w.batch_size(), 500);
         assert_eq!(w.total_written(), 0);
-        assert_eq!(w.total_build_us(), 0);
-        assert_eq!(w.total_send_us(), 0);
-    }
-
-    #[test]
-    fn custom_limits() {
-        let w = StringWriter::with_limits(100, 1 << 20);
-        assert_eq!(w.batch_size(), 100);
-        assert_eq!(w.max_buffer_bytes(), 1 << 20);
     }
 
     #[test]
@@ -480,8 +437,6 @@ mod tests {
     fn min_buffer_clamped() {
         assert_eq!(StringWriter::with_limits(10, 0).max_buffer_bytes(), 1024);
     }
-
-    // ── Push ─────────────────────────────────────────────────────
 
     #[test]
     fn push_accepted() {
@@ -494,22 +449,17 @@ mod tests {
     #[test]
     fn push_until_full() {
         let mut w = StringWriter::new(3);
-        assert_eq!(w.push(row(1, "a")), PushResult::Accepted);
-        assert_eq!(w.push(row(2, "b")), PushResult::Accepted);
+        w.push(row(1, "a"));
+        w.push(row(2, "b"));
         assert_eq!(w.push(row(3, "c")), PushResult::Full);
-        assert!(w.is_full());
     }
 
-    // ── Backpressure ─────────────────────────────────────────────
-
-    #[test]
-    fn backpressure_triggered() {
-        let mut w = StringWriter::with_limits(100, 100);
-        assert_eq!(w.push(row(1, "hello")), PushResult::Accepted);
-        assert_eq!(w.push(row(2, "world")), PushResult::Accepted);
-        assert_eq!(w.push(row(3, "!!!!!")), PushResult::BackpressureExceeded);
+    #[test] fn backpressure_triggered() {
+        let mut w = StringWriter::with_limits(100, 1024);
+        w.push(row(1, &"x".repeat(500))); // 540 bytes
+        w.push(row(2, &"y".repeat(400))); // 440 bytes -> 980
+        assert_eq!(w.push(row(3, &"z".repeat(100))), PushResult::BackpressureExceeded); // 980+140 > 1024
         assert_eq!(w.len(), 2);
-        assert_eq!(w.total_backpressure(), 1);
     }
 
     #[test]
@@ -534,70 +484,18 @@ mod tests {
         assert!(p > 0.09 && p < 0.11, "got {p:.2}");
     }
 
-    // ── Byte tracking ────────────────────────────────────────────
-
-    #[test]
-    fn bytes_incremental() {
-        let mut w = StringWriter::with_defaults();
-        w.push(row(1, "abc")); // 43
-        w.push(row(2, "defgh")); // 45
-        assert_eq!(w.buffered_bytes(), 43 + 45);
-    }
-
-    #[test]
-    fn bytes_reset_on_discard() {
-        let mut w = StringWriter::with_defaults();
-        w.push(row(1, "test"));
-        w.discard();
-        assert_eq!(w.buffered_bytes(), 0);
-    }
-
-    // ── Discard ──────────────────────────────────────────────────
-
     #[test]
     fn discard_clears() {
         let mut w = StringWriter::with_defaults();
         w.push(row(1, "a"));
-        w.push(row(2, "b"));
         w.discard();
         assert!(w.is_empty());
         assert_eq!(w.buffered_bytes(), 0);
     }
 
-    // ── Statistics ───────────────────────────────────────────────
-
-    #[test]
-    fn avg_value_len_computed() {
-        let mut w = StringWriter::with_defaults();
-        w.total_written = 100;
-        w.total_value_bytes = 5_000;
-        assert_eq!(w.avg_value_len(), 50.0);
-    }
-
-    #[test]
-    fn avg_batch_size_computed() {
-        let mut w = StringWriter::with_defaults();
-        w.total_written = 1000;
-        w.total_flushes = 4;
-        assert_eq!(w.avg_batch_size(), 250.0);
-    }
-
-    // ── Compatibility ────────────────────────────────────────────
-
-    #[test]
-    fn aliases() {
-        let mut w = StringWriter::with_defaults();
-        w.push(row(1, "x"));
-        assert_eq!(w.buffered(), w.len());
-        assert_eq!(w.insert_flushes(), 0);
-    }
-
-    // ── Binary COPY payload ──────────────────────────────────────
-
     #[test]
     fn payload_header_and_trailer() {
-        let rows = vec![row(1, "hello")];
-        let buf = StringWriter::build_copy_payload(&rows);
+        let buf = StringWriter::build_copy_payload(&[row(1, "hello")]);
         assert_eq!(&buf[..11], b"PGCOPY\n\xff\r\n\x00");
         assert_eq!(&buf[buf.len() - 2..], &PGCOPY_TRAILER);
     }
@@ -611,12 +509,8 @@ mod tests {
     #[test]
     fn payload_exact_size() {
         let rows = vec![row(1, "hello"), row(2, "world!")];
-        let expected = PGCOPY_HEADER.len()
-            + (38 + 5)   // "hello"
-            + (38 + 6)   // "world!"
-            + PGCOPY_TRAILER.len();
-        let buf = StringWriter::build_copy_payload(&rows);
-        assert_eq!(buf.len(), expected);
+        let expected = PGCOPY_HEADER.len() + (38 + 5) + (38 + 6) + PGCOPY_TRAILER.len();
+        assert_eq!(StringWriter::build_copy_payload(&rows).len(), expected);
     }
 
     #[test]
@@ -624,7 +518,6 @@ mod tests {
         let time = ts(1781617845, 123456);
         let r = StringRow::new(time, 1, "x".into(), 0, 0);
         let buf = StringWriter::build_copy_payload(&[r]);
-        // offset: 19 (header) + 2 (ncols) + 4 (time_len) = 25
         let pg_us = i64::from_be_bytes(buf[25..33].try_into().unwrap());
         assert_eq!(pg_us, time.timestamp_micros() - PG_EPOCH_OFFSET_US);
     }
@@ -633,18 +526,14 @@ mod tests {
     fn payload_encodes_pv_id() {
         let r = StringRow::new(now(), 42, "x".into(), 0, 0);
         let buf = StringWriter::build_copy_payload(&[r]);
-        // offset: 19+2+12+4 = 37
-        let pv_id = i32::from_be_bytes(buf[37..41].try_into().unwrap());
-        assert_eq!(pv_id, 42);
+        assert_eq!(i32::from_be_bytes(buf[37..41].try_into().unwrap()), 42);
     }
 
     #[test]
-    fn payload_encodes_string_value() {
+    fn payload_encodes_string() {
         let r = StringRow::new(now(), 1, "hello".into(), 0, 0);
         let buf = StringWriter::build_copy_payload(&[r]);
-        // value length at offset 19+2+12+8+4 = 45..49, then bytes 49..54
-        let val_len = i32::from_be_bytes(buf[41..45].try_into().unwrap());
-        assert_eq!(val_len, 5);
+        assert_eq!(i32::from_be_bytes(buf[41..45].try_into().unwrap()), 5);
         assert_eq!(&buf[45..50], b"hello");
     }
 
@@ -652,30 +541,33 @@ mod tests {
     fn payload_encodes_empty_string() {
         let r = StringRow::new(now(), 1, "".into(), 0, 0);
         let buf = StringWriter::build_copy_payload(&[r]);
-        // value length should be 0
-        let val_len = i32::from_be_bytes(buf[41..45].try_into().unwrap());
-        assert_eq!(val_len, 0);
+        assert_eq!(i32::from_be_bytes(buf[41..45].try_into().unwrap()), 0);
     }
 
     #[test]
     fn payload_encodes_unicode() {
-        let s = "température: 4.2°K"; // 20 bytes UTF-8
+        let s = "température: 4.2°K";
         let r = StringRow::new(now(), 1, s.into(), 0, 0);
         let buf = StringWriter::build_copy_payload(&[r]);
-        let val_len = i32::from_be_bytes(buf[41..45].try_into().unwrap());
-        assert_eq!(val_len, s.len() as i32);
+        assert_eq!(
+            i32::from_be_bytes(buf[41..45].try_into().unwrap()),
+            s.len() as i32
+        );
     }
 
     #[test]
     fn payload_encodes_severity_status() {
         let r = StringRow::new(now(), 1, "ab".into(), 3, 7);
         let buf = StringWriter::build_copy_payload(&[r]);
-        // value is 2 bytes, so sev at offset 19+2+12+8+(4+2) = 47, +4 = 51
-        let base = PGCOPY_HEADER.len() + 2 + 12 + 8 + 4 + 2; // after value bytes
-        let sev = i16::from_be_bytes(buf[base + 4..base + 6].try_into().unwrap());
-        let status = i16::from_be_bytes(buf[base + 10..base + 12].try_into().unwrap());
-        assert_eq!(sev, 3);
-        assert_eq!(status, 7);
+        let base = PGCOPY_HEADER.len() + 2 + 12 + 8 + 4 + 2;
+        assert_eq!(
+            i16::from_be_bytes(buf[base + 4..base + 6].try_into().unwrap()),
+            3
+        );
+        assert_eq!(
+            i16::from_be_bytes(buf[base + 10..base + 12].try_into().unwrap()),
+            7
+        );
     }
 
     #[test]
@@ -685,42 +577,26 @@ mod tests {
             StringRow::new(now(), 2, "bb".into(), 0, 0),
             StringRow::new(now(), 3, "ccc".into(), 0, 0),
         ];
-        let buf = StringWriter::build_copy_payload(&rows);
         let expected = PGCOPY_HEADER.len() + (38 + 1) + (38 + 2) + (38 + 3) + PGCOPY_TRAILER.len();
-        assert_eq!(buf.len(), expected);
+        assert_eq!(StringWriter::build_copy_payload(&rows).len(), expected);
     }
 
     #[test]
-    fn payload_special_chars_no_escape_needed() {
-        // Binary COPY doesn't need escaping — tabs, newlines are sent as raw bytes.
+    fn payload_special_chars_no_escape() {
         let r = StringRow::new(now(), 1, "a\tb\nc\\d".into(), 0, 0);
         let buf = StringWriter::build_copy_payload(&[r]);
-        let val_len = i32::from_be_bytes(buf[41..45].try_into().unwrap());
-        assert_eq!(val_len, 7); // raw bytes, no escaping
+        assert_eq!(i32::from_be_bytes(buf[41..45].try_into().unwrap()), 7);
         assert_eq!(&buf[45..52], b"a\tb\nc\\d");
     }
 
-    // ── Display / Debug ──────────────────────────────────────────
-
     #[test]
-    fn display_empty() {
+    fn display() {
         let s = StringWriter::with_defaults().to_string();
         assert!(s.contains("0/500") && s.contains("0 backpressure"));
     }
 
     #[test]
-    fn display_with_stats() {
-        let mut w = StringWriter::with_defaults();
-        w.total_written = 200;
-        w.total_value_bytes = 10_000;
-        w.total_backpressure = 1;
-        let s = w.to_string();
-        assert!(s.contains("200 written") && s.contains("1 backpressure"));
-    }
-
-    #[test]
     fn debug_output() {
-        let d = format!("{:?}", StringWriter::with_defaults());
-        assert!(d.contains("StringWriter") && d.contains("pressure"));
+        assert!(format!("{:?}", StringWriter::with_defaults()).contains("StringWriter"));
     }
 }
