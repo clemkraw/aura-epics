@@ -2,8 +2,18 @@
 name = "aura-ingest"
 version = "0.1.0"
 edition = "2024"
-description = "AURA ingestion layer: PVA subscriber, epsilon-filter, heartbeat, Redis publisher"
-license = "Apache-2.0"
+description = "AURA ingestion layer: PVA monitor processing, heartbeat, SharedBuffer writer"
+license = "MIT"
 
 [dependencies]
 aura-core = { path = "../aura-core" }
+aura-net = { path = "../aura-net" }
+aura-store = { path = "../aura-store" }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
