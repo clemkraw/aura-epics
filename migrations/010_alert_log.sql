@@ -9,7 +9,7 @@
 --   - An ingest shard is lost (instance down)
 --   - A PV is served by a different IOC than expected_ioc
 --
--- Read by GET /api/v1/alerts. Old alerts auto-cleaned by retention.
+-- Read by GET /api/v1/alerts.
 
 CREATE TABLE IF NOT EXISTS alert_log
 (

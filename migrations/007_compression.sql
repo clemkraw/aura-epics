@@ -21,9 +21,6 @@
 --
 -- Note: destructured tables (samples_array_num, samples_nv, samples_hist,
 -- samples_cont, samples_mch) have their own compression in 011/012.
--- Old array-column tables (samples_array, samples_histogram, etc.) are
--- kept for backward compatibility but no longer written to — no compression
--- policy needed.
 
 -- ─── Scalar samples (90% of traffic) ────────────────────────────────
 ALTER TABLE samples
