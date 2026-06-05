@@ -3,7 +3,18 @@ name = "aura-store"
 version = "0.1.0"
 edition = "2024"
 description = "AURA database layer: TimescaleDB writer, reader, migrations, PV config CRUD"
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 aura-core = { path = "../aura-core" }
+sqlx = { workspace = true }
+tokio-postgres = { workspace = true }
+tokio = { workspace = true }
+redis = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
