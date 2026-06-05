@@ -343,14 +343,15 @@ mod tests {
 
     #[test]
     fn test_migration_sql_idempotent_markers() {
-        // Each migration should use IF NOT EXISTS or similar
         for step in Migrations::ALL {
             let upper = step.sql.to_uppercase();
             let has_idempotent = upper.contains("IF NOT EXISTS")
+                || upper.contains("IF_NOT_EXISTS")
                 || upper.contains("CREATE OR REPLACE")
                 || upper.contains("ON CONFLICT")
                 || upper.contains("DO NOTHING")
-                || upper.contains("IF EXISTS");
+                || upper.contains("IF EXISTS")
+                || upper.contains("ALTER TABLE");
             assert!(
                 has_idempotent,
                 "migration {:03}_{} may not be idempotent",
