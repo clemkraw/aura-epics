@@ -28,6 +28,8 @@ pub enum SessionCommand {
     },
     /// D4: Stop monitoring a PV — sends CMD_MONITOR STOP + CMD_DESTROY_CHANNEL.
     RemoveMonitor { pv_name: String },
+    /// Graceful shutdown — close TCP connection cleanly (FIN, not RST).
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -42,7 +44,6 @@ impl From<SessionError> for DriverError {
         Self::Session(e)
     }
 }
-
 impl From<std::io::Error> for DriverError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
@@ -199,7 +200,7 @@ impl PvaDriver {
                 let mut session = match PvaSession::connect(srv, timeout, buf_sz, reg_sz).await {
                     Ok(s) => s,
                     Err(e) => {
-                        tracing::warn!(%srv, error = %e, "TCP search R1 connect failed");
+                        tracing::debug!(%srv, error = %e, "TCP search R1 connect failed");
                         return (srv, Vec::new());
                     }
                 };
@@ -238,7 +239,7 @@ impl PvaDriver {
                     let mut session = match PvaSession::connect(srv, timeout, buf_sz, reg_sz).await {
                         Ok(s) => s,
                         Err(e) => {
-                            tracing::warn!(%srv, error = %e, "TCP search R2 connect failed");
+                            tracing::debug!(%srv, error = %e, "TCP search R2 connect failed");
                             return (srv, Vec::new());
                         }
                     };
@@ -296,6 +297,61 @@ impl PvaDriver {
         let config_buf = self.config.buffer_size;
         let config_reg = self.config.registry_size;
 
+        // Split: reuse existing sessions vs create new ones.
+        let mut new_ioc_pvs: HashMap<SocketAddr, Vec<String>> = HashMap::new();
+        let mut existing_ioc_pvs: HashMap<SocketAddr, Vec<String>> = HashMap::new();
+        for (addr, pvs) in server_pvs {
+            if self.session_commands.contains_key(&addr) {
+                existing_ioc_pvs.insert(addr, pvs);
+            } else {
+                new_ioc_pvs.insert(addr, pvs);
+            }
+        }
+
+        // Existing IOCs: add monitors on the SAME TCP connection.
+        for (addr, pvs) in existing_ioc_pvs {
+            if let Some(tx) = self.session_commands.get(&addr) {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(SessionCommand::AddMonitorBatch {
+                        pv_names: pvs.clone(),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    let timeout =
+                        std::time::Duration::from_secs(30 + (pvs.len() as u64 / 500).max(1));
+                    match tokio::time::timeout(timeout, reply_rx).await {
+                        Ok(Ok(batch_results)) => {
+                            let ok = batch_results.iter().filter(|(_, r)| r.is_ok()).count();
+                            for (pv, res) in batch_results {
+                                if res.is_ok() {
+                                    self.pv_server_cache.insert(pv.clone(), addr);
+                                }
+                                results.push((pv, res.map_err(DriverError::Session)));
+                            }
+                            if let Some(existing) = self.ioc_pvs.get_mut(&addr) {
+                                existing.extend(
+                                    pvs.iter()
+                                        .filter(|p| self.pv_server_cache.contains_key(p.as_str()))
+                                        .cloned(),
+                                );
+                            }
+                            tracing::info!(%addr, ok, total = pvs.len(), "added to existing session");
+                        }
+                        _ => {
+                            tracing::warn!(%addr, "AddMonitorBatch timeout — falling back to new session");
+                            new_ioc_pvs.insert(addr, pvs);
+                        }
+                    }
+                } else {
+                    new_ioc_pvs.insert(addr, pvs);
+                }
+            }
+        }
+
+        // New IOCs: create fresh TCP sessions.
         let mut subscribe_handles: Vec<
             tokio::task::JoinHandle<
                 Option<(
@@ -307,7 +363,7 @@ impl PvaDriver {
             >,
         > = Vec::new();
 
-        for (addr, pvs) in server_pvs {
+        for (addr, pvs) in new_ioc_pvs {
             let bus = bus_tx_clone.clone();
             let meta_buf = self.metadata_buf.clone();
             let pv_cache_clone = self.pv_cache.clone();
@@ -632,13 +688,15 @@ impl PvaDriver {
         if let Some(cancel) = self.cancel_tokens.remove(addr) {
             cancel.cancel();
         }
-
+        // Move PVs to failed_pvs so they can be re-searched on a new IOC.
         if let Some(pvs) = self.ioc_pvs.remove(addr) {
             self.failed_pvs.extend(pvs);
         }
         self.session_commands.remove(addr);
         self.pv_server_cache.retain(|_, v| v != addr);
     }
+
+    // Accessors
 
     pub fn session_count(&self) -> usize {
         self.session_commands.len()
@@ -651,6 +709,20 @@ impl PvaDriver {
     }
     pub fn ioc_pvs(&self) -> &HashMap<SocketAddr, Vec<String>> {
         &self.ioc_pvs
+    }
+
+    /// Graceful shutdown: send TCP FIN to all IOCs (not RST).
+    pub async fn shutdown_sessions(&self) {
+        for (addr, tx) in &self.session_commands {
+            let _ = tx.send(SessionCommand::Shutdown).await;
+            tracing::debug!(%addr, "sent shutdown to session");
+        }
+        // Cancel reconnect loops so they don't restart.
+        for cancel in self.cancel_tokens.values() {
+            cancel.cancel();
+        }
+        // Brief yield to let sessions flush their TCP FIN.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     pub fn session_commands_mut(
         &mut self,
