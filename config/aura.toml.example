@@ -1,0 +1,34 @@
+# --- Redis (command channel only) ---
+[redis]
+url = "redis://127.0.0.1:6379"
+
+# --- Long-term persistence (TimescaleDB) ---
+[database]
+url = "postgresql://aura:aura@localhost/aura"
+max_connections = 5
+
+# --- EPICS network monitoring ---
+[discover]
+name_servers = ["172.17.134.230:5075"]
+config_poll_interval_s = 30       # Check for PV modifications in DB every 30s
+
+# --- PV Ingestion ---
+[ingest]
+default_heartbeat_s = 0.0         # 0 = disabled
+
+# --- Database writing ---
+[store]
+batch_size = 200000               # Number of rows for SQL COPY batching
+flush_interval_ms = 100           # Maximum latency before flushing to disk
+
+# --- Interfaces & Monitoring (planned) ---
+[api]
+bind = "0.0.0.0:8080"             # REST API bind address for data queries
+
+[metrics]
+bind = "0.0.0.0:9090"             # Prometheus metrics endpoint
+
+# --- Observability ---
+[telemetry]
+log_level = "info"                # trace, debug, info, warn, error
+log_format = "pretty"             # "json" for prod (ELK/Loki), "pretty" for dev
