@@ -75,7 +75,7 @@ pub fn run_ingest_shard(
                     *value,
                     *severity as i16,
                     *status as i16,
-                    aura_core::sample::StoreReason::EpsilonExceeded,
+                    aura_core::sample::StoreReason::ValueChanged,
                 ));
                 let idx = pv_id as usize;
                 if idx <= 1_000_000 {
@@ -194,7 +194,7 @@ pub fn run_ingest_shard(
                                     nt.value.as_f64().unwrap_or(0.0),
                                     nt.alarm.severity as i16,
                                     nt.alarm.status as i16,
-                                    aura_core::sample::StoreReason::EpsilonExceeded,
+                                    aura_core::sample::StoreReason::ValueChanged,
                                 ));
                             }
                             NormativeType::NTEnum(nt) => {
@@ -204,7 +204,7 @@ pub fn run_ingest_shard(
                                     nt.value.as_f64(),
                                     nt.alarm.severity as i16,
                                     nt.alarm.status as i16,
-                                    aura_core::sample::StoreReason::EpsilonExceeded,
+                                    aura_core::sample::StoreReason::ValueChanged,
                                 ));
                             }
                             NormativeType::NTScalarArray(a) => {

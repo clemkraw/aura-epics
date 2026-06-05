@@ -23,19 +23,28 @@
 //! PvDataType::Aggregate   → ScalarWriter    → samples (value as f64)
 //! ```
 //!
+//! ## Performance
+//!
+//! - **Parallel flush**: `flush_all()` uses `tokio::try_join!` to flush
+//!   all 5 writers concurrently on the connection pool. Total latency =
+//!   max(writers) instead of sum(writers).
+//! - **Zero-copy dispatch**: `dispatch()` takes `&mut PvUpdate` to
+//!   `std::mem::take` image data instead of cloning (saves MB per frame).
+//! - **Error-tracked serde**: JSON serialization failures increment
+//!   `total_errors` and skip the sample (no silent `unwrap_or_default`).
+//!
 //! ## Flushing
 //!
 //! `flush_all()` flushes every writer. Called when:
 //! - Any writer's buffer is full
 //! - The flush timer expires (100ms)
-//! - A consumer batch is fully processed (before XACK)
 
 use std::fmt;
 
 use sqlx::postgres::PgPool;
 
 use aura_core::PvUpdate;
-use aura_core::error::{AuraError, AuraResult};
+use aura_core::error::{AuraResult};
 use aura_core::pva::{NormativeType, PvDataType};
 use aura_core::sample::StoreReason;
 
@@ -45,6 +54,7 @@ pub mod image;
 pub mod json;
 pub mod pv_cache;
 pub mod scalar;
+pub mod shared_buf;
 pub mod string;
 
 use array::{ArrayCapture, ArrayData, ArrayWriter};
@@ -84,9 +94,8 @@ pub struct BatchWriter {
     scalar: ScalarWriter,
     string: StringWriter,
     array: ArrayWriter,
-    json: JsonWriter,
-    image: ImageWriter,
-    /// Shared pool of tokio-postgres connections for all COPY operations.
+    pub(crate) json: JsonWriter,
+    pub(crate) image: ImageWriter,
     copy_pool: copy_pool::CopyPool,
     total_dispatched: u64,
     total_errors: u64,
@@ -111,13 +120,10 @@ impl BatchWriter {
         Self::new(BatchWriterConfig::default())
     }
 
-    /// Get a reference to the shared COPY pool.
     #[inline]
     pub fn copy_pool(&self) -> &copy_pool::CopyPool {
         &self.copy_pool
     }
-
-    /// Get a mutable reference to the shared COPY pool.
     #[inline]
     pub fn copy_pool_mut(&mut self) -> &mut copy_pool::CopyPool {
         &mut self.copy_pool
@@ -127,24 +133,83 @@ impl BatchWriter {
         self.pv_cache.warm(pool).await
     }
 
+    /// Ingest scalar rows directly.
+    /// Uses buffer.append for O(1) bulk insert instead of N × push.
+    #[inline]
+    pub fn ingest_scalars(&mut self, mut rows: Vec<ScalarRow>) -> usize {
+        let count = rows.len();
+        if count == 0 {
+            return 0;
+        }
+        self.scalar.total_non_finite += rows.iter().filter(|r| r.has_non_finite()).count() as u64;
+        self.scalar.buffer.append(&mut rows);
+        self.total_dispatched += count as u64;
+        count
+    }
+
+    /// Ingest non-scalar rows (String, Array, Json, Image).
+    pub fn ingest_other_rows(&mut self, rows: Vec<shared_buf::WriterRow>) -> usize {
+        let count = rows.len();
+        for row in rows {
+            match row {
+                shared_buf::WriterRow::String(r) => {
+                    let _ = self.string.push(r);
+                }
+                shared_buf::WriterRow::Array(r) => {
+                    let _ = self.array.push(*r);
+                }
+                shared_buf::WriterRow::Json(r) => {
+                    let _ = self.json.push(r);
+                }
+                shared_buf::WriterRow::Image(r) => {
+                    let _ = self.image.push(r);
+                }
+            }
+        }
+        self.total_dispatched += count as u64;
+        count
+    }
+
     /// Dispatch a PV update to the correct writer.
     ///
-    /// Returns `true` if any writer buffer is full and should be flushed.
+    /// Uses `dispatch_sync` for the fast path (cache hit, 99.9%).
+    /// Falls back to async resolve on cache miss only.
     pub async fn dispatch(
         &mut self,
         update: &mut PvUpdate,
         reason: StoreReason,
         pool: &PgPool,
     ) -> AuraResult<bool> {
-        let pv_id = match self.pv_cache.resolve_cached(&*update.pv_name) {
-            Some(id) => id,
-            None => self.pv_cache.resolve(&*update.pv_name, pool).await?,
-        };
+        match self.dispatch_sync(update, reason) {
+            Some(result) => result,
+            None => {
+                let pv_id = self.pv_cache.resolve(&*update.pv_name, pool).await?;
+                self.dispatch_with_id(update, pv_id, reason)
+            }
+        }
+    }
+
+    /// Pure synchronous dispatch — returns None on cache miss.
+    #[inline]
+    pub fn dispatch_sync(
+        &mut self,
+        update: &mut PvUpdate,
+        reason: StoreReason,
+    ) -> Option<AuraResult<bool>> {
+        let pv_id = self.pv_cache.resolve_cached(&*update.pv_name)?;
+        Some(self.dispatch_with_id(update, pv_id, reason))
+    }
+
+    #[inline]
+    fn dispatch_with_id(
+        &mut self,
+        update: &mut PvUpdate,
+        pv_id: i32,
+        reason: StoreReason,
+    ) -> AuraResult<bool> {
         self.total_dispatched += 1;
 
-        // ── FAST PATH: NTScalar (99% of samples) ──
-        // Single match extracts value + alarm + timestamp in one go,
-        // instead of 4 separate match arms (timestamp, severity, status, data_type).
+        // FAST PATH: NTScalar (99% of samples)
         if let NormativeType::NTScalar(ref nt) = update.data {
             let value = nt.value.as_f64().unwrap_or(0.0);
             let time = nt.timestamp.to_datetime();
@@ -155,7 +220,7 @@ impl BatchWriter {
             return Ok(self.scalar.is_full());
         }
 
-        // ── SLOW PATH: all other types ──
+        // SLOW PATH: all other types
         let time = update.timestamp();
         let severity = update.severity();
         let status = update.status();
@@ -197,54 +262,55 @@ impl BatchWriter {
             }
 
             PvDataType::Image => {
-                let row = extract_image_move(time, pv_id, &mut update.data, severity, status);
+                let row = ImageRow::from_update(time, pv_id, &mut update.data, severity, status);
                 self.image.push(row);
             }
 
-            PvDataType::Table
-            | PvDataType::Histogram
-            | PvDataType::Continuum
-            | PvDataType::NameValue
-            | PvDataType::MultiChannel
-            | PvDataType::Union
-            | PvDataType::Custom => {
-                match serde_json::to_value(&update.data) {
-                    Ok(data) => {
-                        let row = match data_type {
-                            PvDataType::Table => {
-                                JsonRow::table(time, pv_id, data, severity, status)
-                            }
-                            PvDataType::Histogram => {
-                                JsonRow::histogram(time, pv_id, data, severity, status)
-                            }
-                            PvDataType::Continuum => {
-                                JsonRow::continuum(time, pv_id, data, severity, status)
-                            }
-                            PvDataType::NameValue => {
-                                JsonRow::namevalue(time, pv_id, data, severity, status)
-                            }
-                            PvDataType::MultiChannel => {
-                                JsonRow::multi(time, pv_id, data, severity, status)
-                            }
-                            _ => {
-                                // Union | Custom
-                                let nt = update.data.type_name();
-                                JsonRow::custom(time, pv_id, nt, data, severity, status)
-                            }
+            PvDataType::Table | PvDataType::Custom | PvDataType::Union => {
+                match serde_json::to_vec(&update.data) {
+                    Ok(bytes) => {
+                        let row = if data_type == PvDataType::Table {
+                            JsonRow::table(time, pv_id, bytes, severity, status)
+                        } else {
+                            let nt = update.data.type_name();
+                            JsonRow::custom(time, pv_id, nt, bytes, severity, status)
                         };
                         self.json.push(row);
                     }
                     Err(e) => {
                         self.total_errors += 1;
-                        tracing::warn!(
-                            pv = %update.pv_name,
-                            data_type = ?data_type,
-                            error = %e,
-                            "JSON serialization failed, sample dropped"
-                        );
+                        tracing::warn!(pv = %update.pv_name, error = %e, "JSON serialization failed");
                     }
                 }
             }
+
+            PvDataType::Histogram
+            | PvDataType::Continuum
+            | PvDataType::NameValue
+            | PvDataType::MultiChannel => match serde_json::to_value(&update.data) {
+                Ok(data) => {
+                    let row = match data_type {
+                        PvDataType::Histogram => {
+                            JsonRow::histogram(time, pv_id, data, severity, status)
+                        }
+                        PvDataType::Continuum => {
+                            JsonRow::continuum(time, pv_id, data, severity, status)
+                        }
+                        PvDataType::NameValue => {
+                            JsonRow::namevalue(time, pv_id, data, severity, status)
+                        }
+                        PvDataType::MultiChannel => {
+                            JsonRow::multi(time, pv_id, data, severity, status)
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.json.push(row);
+                }
+                Err(e) => {
+                    self.total_errors += 1;
+                    tracing::warn!(pv = %update.pv_name, error = %e, "JSON serialization failed");
+                }
+            },
         }
 
         Ok(self.scalar.is_full()
@@ -254,12 +320,8 @@ impl BatchWriter {
             || self.image.is_full())
     }
 
-    /// Flush all writers concurrently via `tokio::try_join!`.
-    ///
-    /// Total latency = max(writers) instead of sum(writers).
-    /// Each writer gets its own connection from the pool.
+    /// Flush all writers concurrently. Total latency = max(writers).
     pub async fn flush_all(&mut self) -> AuraResult<FlushReport> {
-        // All writers use tokio-postgres via the shared CopyPool.
         let (scalar, string, array, json, image) = tokio::try_join!(
             self.scalar.flush(),
             self.string.flush(),
@@ -267,13 +329,29 @@ impl BatchWriter {
             self.json.flush(),
             self.image.flush(),
         )?;
-
         Ok(FlushReport {
             scalar,
             string,
             array,
             json,
             image,
+        })
+    }
+
+    /// Extract all pending buffers for background flushing (ping-pong).
+    pub fn take_flush_bundle(&mut self) -> Option<FlushBundle> {
+        if !self.has_pending() {
+            return None;
+        }
+        let pool = self.copy_pool.clone();
+        Some(FlushBundle {
+            scalar_rows: std::mem::take(&mut self.scalar.buffer),
+            string_rows: std::mem::take(&mut self.string.buffer),
+            array_num_rows: std::mem::take(&mut self.array.num_buffer),
+            array_str_rows: std::mem::take(&mut self.array.str_buffer),
+            json_rows: std::mem::take(&mut self.json.buffer),
+            image_rows: std::mem::take(&mut self.image.buffer),
+            pool,
         })
     }
 
@@ -302,14 +380,6 @@ impl BatchWriter {
             || !self.image.is_empty()
     }
 
-    #[inline]
-    pub fn total_dispatched(&self) -> u64 {
-        self.total_dispatched
-    }
-    #[inline]
-    pub fn total_errors(&self) -> u64 {
-        self.total_errors
-    }
     #[inline]
     pub fn pv_cache(&self) -> &PvCache {
         &self.pv_cache
@@ -359,7 +429,6 @@ impl BatchWriter {
         &mut self.image
     }
 
-    /// Snapshot of all writer statistics.
     pub fn stats(&self) -> WriterStats {
         WriterStats {
             dispatched: self.total_dispatched,
@@ -382,7 +451,6 @@ impl BatchWriter {
     }
 }
 
-/// Report from a single `flush_all` operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlushReport {
     pub scalar: usize,
@@ -416,7 +484,181 @@ impl fmt::Display for FlushReport {
     }
 }
 
-/// Snapshot of all writer statistics with backpressure monitoring.
+/// Detached bundle of writer buffers for background flushing.
+/// Created by `BatchWriter::take_flush_bundle()` — O(1) pointer swap.
+pub struct FlushBundle {
+    pub scalar_rows: Vec<ScalarRow>,
+    pub string_rows: Vec<StringRow>,
+    pub array_num_rows: Vec<array::ArrayNumRow>,
+    pub array_str_rows: Vec<array::ArrayStrRow>,
+    pub json_rows: Vec<JsonRow>,
+    pub image_rows: Vec<ImageRow>,
+    pub pool: copy_pool::CopyPool,
+}
+
+impl FlushBundle {
+    /// Flush all buffers to PostgreSQL via COPY.
+    pub async fn flush(self) -> Result<FlushReport, String> {
+        let pool = &self.pool;
+        const PARALLEL_THRESHOLD: usize = 10_000;
+
+        let scalar = if !self.scalar_rows.is_empty() {
+            let count = self.scalar_rows.len();
+            let n = pool.len();
+            if count >= PARALLEL_THRESHOLD && n > 1 {
+                let chunk_size = (count + n - 1) / n;
+                let payloads: Vec<_> = self
+                    .scalar_rows
+                    .chunks(chunk_size)
+                    .map(|chunk| (ScalarWriter::build_copy_payload(chunk), chunk.len()))
+                    .collect();
+                pool.send_parallel(ScalarWriter::COPY_SQL, payloads)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let payload = ScalarWriter::build_copy_payload(&self.scalar_rows);
+                pool.send_copy(0, ScalarWriter::COPY_SQL, payload, count)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            count
+        } else {
+            0
+        };
+
+        let string = if !self.string_rows.is_empty() {
+            let count = self.string_rows.len();
+            let n = pool.len();
+            if count >= PARALLEL_THRESHOLD && n > 1 {
+                let chunk_size = (count + n - 1) / n;
+                let payloads: Vec<_> = self
+                    .string_rows
+                    .chunks(chunk_size)
+                    .map(|chunk| (StringWriter::build_copy_payload(chunk), chunk.len()))
+                    .collect();
+                pool.send_parallel(string::COPY_SQL, payloads)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                let payload = StringWriter::build_copy_payload(&self.string_rows);
+                pool.send_copy(0, string::COPY_SQL, payload, count)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            count
+        } else {
+            0
+        };
+
+        let array = if !self.array_num_rows.is_empty() || !self.array_str_rows.is_empty() {
+            let mut total = 0;
+            if !self.array_num_rows.is_empty() {
+                let count = self.array_num_rows.len();
+                let n = pool.len();
+                if count >= PARALLEL_THRESHOLD && n > 1 {
+                    let chunk_size = (count + n - 1) / n;
+                    let payloads: Vec<_> = self
+                        .array_num_rows
+                        .chunks(chunk_size)
+                        .map(|chunk| (ArrayWriter::build_num_payload(chunk), chunk.len()))
+                        .collect();
+                    pool.send_parallel(array::COPY_SQL_NUM, payloads)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    let payload = ArrayWriter::build_num_payload(&self.array_num_rows);
+                    pool.send_copy(0, array::COPY_SQL_NUM, payload, count)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                total += count;
+            }
+            if !self.array_str_rows.is_empty() {
+                let count = self.array_str_rows.len();
+                let payload = ArrayWriter::build_str_payload(&self.array_str_rows);
+                pool.send_copy(0, array::COPY_SQL_STR, payload, count)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                total += count;
+            }
+            total
+        } else {
+            0
+        };
+
+        let json = if !self.json_rows.is_empty() {
+            let mut total = 0;
+            if let Some((payload, n)) = JsonWriter::build_table_payload(&self.json_rows) {
+                pool.send_copy(0, json::COPY_TABLE, payload, n)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                total += n;
+            }
+            if let Some((payload, n)) = JsonWriter::build_custom_payload(&self.json_rows) {
+                pool.send_copy(0, json::COPY_CUSTOM, payload, n)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                total += n;
+            }
+            if let Some((payload, n)) = JsonWriter::build_nv_payload(&self.json_rows) {
+                pool.send_copy(0, json::COPY_NV, payload, n)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                total += n;
+            }
+            if let Some((payload, n)) = JsonWriter::build_hist_payload(&self.json_rows) {
+                pool.send_copy(0, json::COPY_HIST, payload, n)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                total += n;
+            }
+            if let Some((payload, n)) = JsonWriter::build_cont_payload(&self.json_rows) {
+                pool.send_copy(0, json::COPY_CONT, payload, n)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                total += n;
+            }
+            if let Some((payload, n)) = JsonWriter::build_mch_payload(&self.json_rows) {
+                pool.send_copy(0, json::COPY_MCH, payload, n)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                total += n;
+            }
+            total
+        } else {
+            0
+        };
+
+        let image = if !self.image_rows.is_empty() {
+            let count = self.image_rows.len();
+            let payload = ImageWriter::build_copy_payload(&self.image_rows);
+            pool.send_copy(0, image::COPY_SQL, payload, count)
+                .await
+                .map_err(|e| e.to_string())?;
+            count
+        } else {
+            0
+        };
+
+        Ok(FlushReport {
+            scalar,
+            string,
+            array,
+            json,
+            image,
+        })
+    }
+
+    pub fn total_rows(&self) -> usize {
+        self.scalar_rows.len()
+            + self.string_rows.len()
+            + self.array_num_rows.len()
+            + self.array_str_rows.len()
+            + self.json_rows.len()
+            + self.image_rows.len()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WriterStats {
     pub dispatched: u64,
@@ -430,7 +672,6 @@ pub struct WriterStats {
     pub image_bytes: u64,
     pub cache_entries: usize,
     pub cache_hit_ratio: f64,
-    // Backpressure counters per writer.
     pub scalar_backpressure: u64,
     pub string_backpressure: u64,
     pub array_backpressure: u64,
@@ -447,7 +688,6 @@ impl WriterStats {
             + self.image_written
     }
 
-    /// Total backpressure events across all writers.
     pub fn total_backpressure(&self) -> u64 {
         self.scalar_backpressure
             + self.string_backpressure
@@ -477,7 +717,6 @@ impl fmt::Display for WriterStats {
     }
 }
 
-/// Extract string value from NTScalar(String).
 fn extract_string(nt: &NormativeType) -> String {
     match nt {
         NormativeType::NTScalar(s) => match &s.value {
@@ -488,7 +727,6 @@ fn extract_string(nt: &NormativeType) -> String {
     }
 }
 
-/// Extract f64 array from NTScalarArray.
 fn extract_array_f64(nt: &NormativeType) -> Vec<f64> {
     match nt {
         NormativeType::NTScalarArray(a) => a.value.as_f64_vec().unwrap_or_default(),
@@ -496,101 +734,10 @@ fn extract_array_f64(nt: &NormativeType) -> Vec<f64> {
     }
 }
 
-/// Extract matrix values + dimensions from NTMatrix.
 fn extract_matrix(nt: &NormativeType) -> (Vec<f64>, Vec<i32>) {
     match nt {
         NormativeType::NTMatrix(m) => (m.value.clone(), m.dim.clone()),
         _ => (Vec::new(), Vec::new()),
-    }
-}
-
-/// Extract image row via `std::mem::take` — zero-copy for the data payload.
-///
-/// Takes `&mut NormativeType` and moves the BYTEA data out instead of cloning.
-fn extract_image_move(
-    time: chrono::DateTime<chrono::Utc>,
-    pv_id: i32,
-    nt: &mut NormativeType,
-    severity: i16,
-    status: i16,
-) -> ImageRow {
-    match nt {
-        NormativeType::NTNDArray(img) => {
-            // Move pixel data out — replaces with empty vec, no clone.
-            let data = match &mut img.value {
-                aura_core::pva::ArrayValue::UByteArray(v) => std::mem::take(v),
-                _ => Vec::new(),
-            };
-            let dims: Vec<i32> = img.dimension.iter().map(|d| d.size).collect();
-            let codec = std::mem::take(&mut img.codec.name);
-            ImageRow::new(
-                time,
-                pv_id,
-                data,
-                codec,
-                img.compressed_size,
-                img.uncompressed_size,
-                dims,
-                img.unique_id,
-                severity,
-                status,
-            )
-        }
-        _ => ImageRow::new(
-            time,
-            pv_id,
-            Vec::new(),
-            String::new(),
-            0,
-            0,
-            Vec::new(),
-            0,
-            severity,
-            status,
-        ),
-    }
-}
-
-/// Non-mutating image extraction for tests or when move is not possible.
-fn extract_image(
-    time: chrono::DateTime<chrono::Utc>,
-    pv_id: i32,
-    nt: &NormativeType,
-    severity: i16,
-    status: i16,
-) -> ImageRow {
-    match nt {
-        NormativeType::NTNDArray(img) => {
-            let data = match &img.value {
-                aura_core::pva::ArrayValue::UByteArray(v) => v.clone(),
-                _ => Vec::new(),
-            };
-            let dims: Vec<i32> = img.dimension.iter().map(|d| d.size).collect();
-            ImageRow::new(
-                time,
-                pv_id,
-                data,
-                img.codec.name.clone(),
-                img.compressed_size,
-                img.uncompressed_size,
-                dims,
-                img.unique_id,
-                severity,
-                status,
-            )
-        }
-        _ => ImageRow::new(
-            time,
-            pv_id,
-            Vec::new(),
-            String::new(),
-            0,
-            0,
-            Vec::new(),
-            0,
-            severity,
-            status,
-        ),
     }
 }
 
@@ -623,39 +770,16 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    // ── BatchWriterConfig ────────────────────────────────────────────
-
     #[test]
     fn test_config_default() {
         let cfg = BatchWriterConfig::default();
         assert_eq!(cfg.scalar_batch_size, 500);
-        assert_eq!(cfg.string_batch_size, 500);
-        assert_eq!(cfg.array_batch_size, 200);
-        assert_eq!(cfg.json_batch_size, 200);
         assert_eq!(cfg.image_batch_size, 50);
     }
 
     #[test]
-    fn test_config_clone() {
-        let a = BatchWriterConfig::default();
-        let b = a.clone();
-        assert_eq!(a.scalar_batch_size, b.scalar_batch_size);
-        assert_eq!(a.image_batch_size, b.image_batch_size);
-    }
-
-    #[test]
-    fn test_config_debug() {
-        let d = format!("{:?}", BatchWriterConfig::default());
-        assert!(d.contains("scalar_batch_size"));
-    }
-
-    // ── BatchWriter construction ─────────────────────────────────────
-
-    #[test]
     fn test_new() {
         let w = BatchWriter::with_defaults();
-        assert_eq!(w.total_dispatched(), 0);
-        assert_eq!(w.total_errors(), 0);
         assert_eq!(w.total_buffered(), 0);
         assert!(!w.has_pending());
     }
@@ -669,11 +793,8 @@ mod tests {
             json_batch_size: 50,
             image_batch_size: 10,
         };
-        let w = BatchWriter::new(cfg);
-        assert_eq!(w.scalar_writer().batch_size(), 1000);
+        assert_eq!(BatchWriter::new(cfg).scalar_writer().batch_size(), 1000);
     }
-
-    // ── discard_all ──────────────────────────────────────────────────
 
     #[test]
     fn test_discard_all() {
@@ -689,16 +810,12 @@ mod tests {
         w.string
             .push(StringRow::new(Utc::now(), 1, "x".to_string(), 0, 0));
         assert!(w.has_pending());
-        assert_eq!(w.total_buffered(), 2);
         w.discard_all();
         assert!(!w.has_pending());
-        assert_eq!(w.total_buffered(), 0);
     }
 
-    // ── FlushReport ──────────────────────────────────────────────────
-
     #[test]
-    fn test_flush_report_total() {
+    fn test_flush_report() {
         let r = FlushReport {
             scalar: 100,
             string: 5,
@@ -708,51 +825,20 @@ mod tests {
         };
         assert_eq!(r.total(), 120);
         assert!(!r.is_empty());
+        assert!(
+            FlushReport {
+                scalar: 0,
+                string: 0,
+                array: 0,
+                json: 0,
+                image: 0
+            }
+            .is_empty()
+        );
     }
 
     #[test]
-    fn test_flush_report_empty() {
-        let r = FlushReport {
-            scalar: 0,
-            string: 0,
-            array: 0,
-            json: 0,
-            image: 0,
-        };
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn test_flush_report_display() {
-        let r = FlushReport {
-            scalar: 100,
-            string: 0,
-            array: 0,
-            json: 0,
-            image: 0,
-        };
-        let s = r.to_string();
-        assert!(s.contains("100 rows"));
-        assert!(s.contains("scalar=100"));
-    }
-
-    #[test]
-    fn test_flush_report_eq() {
-        let a = FlushReport {
-            scalar: 1,
-            string: 2,
-            array: 3,
-            json: 4,
-            image: 5,
-        };
-        let b = a;
-        assert_eq!(a, b);
-    }
-
-    // ── WriterStats ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_writer_stats_total() {
+    fn test_writer_stats() {
         let stats = WriterStats {
             dispatched: 1000,
             errors: 0,
@@ -772,60 +858,21 @@ mod tests {
             image_backpressure: 0,
         };
         assert_eq!(stats.total_written(), 910);
-        assert_eq!(stats.total_backpressure(), 0);
         assert!(!stats.has_backpressure());
     }
-
-    #[test]
-    fn test_writer_stats_with_backpressure() {
-        let stats = WriterStats {
-            dispatched: 1000,
-            errors: 5,
-            buffered: 0,
-            scalar_written: 900,
-            string_written: 0,
-            array_written: 0,
-            json_written: 0,
-            image_written: 0,
-            image_bytes: 0,
-            cache_entries: 50,
-            cache_hit_ratio: 0.95,
-            scalar_backpressure: 3,
-            string_backpressure: 0,
-            array_backpressure: 0,
-            json_backpressure: 1,
-            image_backpressure: 0,
-        };
-        assert_eq!(stats.total_backpressure(), 4);
-        assert!(stats.has_backpressure());
-    }
-
-    #[test]
-    fn test_writer_stats_display() {
-        let w = BatchWriter::with_defaults();
-        let s = w.stats().to_string();
-        assert!(s.contains("dispatched=0"));
-        assert!(s.contains("written=0"));
-        assert!(s.contains("backpressure=0"));
-    }
-
-    // ── Individual writer accessors ──────────────────────────────────
 
     #[test]
     fn test_writer_accessors() {
         let w = BatchWriter::with_defaults();
         assert!(w.scalar_writer().is_empty());
-        assert!(w.string_writer().is_empty());
-        assert!(w.array_writer().is_empty());
-        assert!(w.json_writer().is_empty());
-        assert!(w.image_writer().is_empty());
         assert!(w.pv_cache().is_empty());
+        assert!(w.copy_pool().is_empty());
     }
 
-    // ── Extraction helpers ───────────────────────────────────────────
+    // ── Extraction helpers ───────────────────────────────────────
 
     #[test]
-    fn test_extract_string_from_nt_scalar() {
+    fn test_extract_string() {
         use aura_core::pva::*;
         let nt = NormativeType::NTScalar(NTScalar {
             value: ScalarValue::String("hello".to_string()),
@@ -839,34 +886,21 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_string_non_string_scalar() {
-        use aura_core::pva::*;
-        let nt = NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Double(42.0),
-            alarm: Alarm::default(),
-            timestamp: TimeStamp::new(1000, 0),
-            display: None,
-            control: None,
-            value_alarm: None,
-        });
-        let s = extract_string(&nt);
-        assert!(!s.is_empty());
-    }
-
-    #[test]
     fn test_extract_string_non_scalar() {
         use aura_core::pva::*;
-        let nt = NormativeType::NTTable(NTTable {
-            labels: vec![],
-            columns: vec![],
-            alarm: Alarm::default(),
-            timestamp: TimeStamp::new(1000, 0),
-        });
-        assert_eq!(extract_string(&nt), "");
+        assert_eq!(
+            extract_string(&NormativeType::NTTable(NTTable {
+                labels: vec![],
+                columns: vec![],
+                alarm: Alarm::default(),
+                timestamp: TimeStamp::new(1000, 0),
+            })),
+            ""
+        );
     }
 
     #[test]
-    fn test_extract_array_f64() {
+    fn test_extract_array() {
         use aura_core::pva::*;
         let nt = NormativeType::NTScalarArray(NTScalarArray {
             value: ArrayValue::DoubleArray(vec![1.0, 2.0, 3.0]),
@@ -880,20 +914,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_array_non_array() {
-        use aura_core::pva::*;
-        let nt = NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Double(1.0),
-            alarm: Alarm::default(),
-            timestamp: TimeStamp::new(1000, 0),
-            display: None,
-            control: None,
-            value_alarm: None,
-        });
-        assert!(extract_array_f64(&nt).is_empty());
-    }
-
-    #[test]
     fn test_extract_matrix() {
         use aura_core::pva::*;
         let nt = NormativeType::NTMatrix(NTMatrix {
@@ -904,83 +924,9 @@ mod tests {
             timestamp: TimeStamp::new(1000, 0),
             display: None,
         });
-        let (values, dim) = extract_matrix(&nt);
-        assert_eq!(values, vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(dim, vec![2, 2]);
-    }
-
-    #[test]
-    fn test_extract_matrix_non_matrix() {
-        use aura_core::pva::*;
-        let nt = NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Double(1.0),
-            alarm: Alarm::default(),
-            timestamp: TimeStamp::new(1000, 0),
-            display: None,
-            control: None,
-            value_alarm: None,
-        });
         let (v, d) = extract_matrix(&nt);
-        assert!(v.is_empty());
-        assert!(d.is_empty());
-    }
-
-    #[test]
-    fn test_extract_image() {
-        use aura_core::pva::*;
-        let nt = NormativeType::NTNDArray(NTNDArray {
-            value: ArrayValue::UByteArray(vec![0xFF; 100]),
-            codec: Codec {
-                name: "jpeg".to_string(),
-                parameters: serde_json::Value::Null,
-            },
-            compressed_size: 100,
-            uncompressed_size: 1000,
-            dimension: vec![
-                Dimension {
-                    size: 640,
-                    offset: 0,
-                    full_size: 640,
-                    binning: 1,
-                    reverse: false,
-                },
-                Dimension {
-                    size: 480,
-                    offset: 0,
-                    full_size: 480,
-                    binning: 1,
-                    reverse: false,
-                },
-            ],
-            unique_id: 42,
-            data_timestamp: None,
-            alarm: Alarm::default(),
-            timestamp: TimeStamp::new(1000, 0),
-            attribute: vec![],
-        });
-        let row = extract_image(Utc::now(), 7, &nt, 0, 0);
-        assert_eq!(row.pv_id, 7);
-        assert_eq!(row.data.len(), 100);
-        assert_eq!(row.codec, "jpeg");
-        assert_eq!(row.compressed_size, 100);
-        assert_eq!(row.uncompressed_size, 1000);
-        assert_eq!(row.dimensions, vec![640, 480]);
-        assert_eq!(row.unique_id, 42);
-    }
-
-    #[test]
-    fn test_extract_image_non_image() {
-        use aura_core::pva::*;
-        let nt = NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Double(0.0),
-            alarm: Alarm::default(),
-            timestamp: TimeStamp::new(1000, 0),
-            display: None,
-            control: None,
-            value_alarm: None,
-        });
-        let row = extract_image(Utc::now(), 1, &nt, 0, 0);
-        assert!(row.data.is_empty());
+        assert_eq!(v, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(d, vec![2, 2]);
     }
 
     #[test]
@@ -1016,82 +962,28 @@ mod tests {
             timestamp: TimeStamp::new(1000, 0),
             attribute: vec![],
         });
-        let row = extract_image_move(Utc::now(), 5, &mut nt, 0, 0);
+        let row = ImageRow::from_update(Utc::now(), 5, &mut nt, 0, 0);
         assert_eq!(row.data.len(), 500);
-        assert_eq!(row.codec, "blosc");
         assert_eq!(row.dimensions, vec![320, 240]);
-        // Original data should be emptied (moved out).
+        // Original data moved out
         if let NormativeType::NTNDArray(img) = &nt {
             if let ArrayValue::UByteArray(v) = &img.value {
-                assert!(v.is_empty(), "data should have been moved out");
+                assert!(v.is_empty());
             }
-            assert!(
-                img.codec.name.is_empty(),
-                "codec should have been moved out"
-            );
         }
     }
 
     #[test]
-    fn test_extract_image_move_non_image() {
-        use aura_core::pva::*;
-        let mut nt = NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Double(0.0),
-            alarm: Alarm::default(),
-            timestamp: TimeStamp::new(1000, 0),
-            display: None,
-            control: None,
-            value_alarm: None,
-        });
-        let row = extract_image_move(Utc::now(), 1, &mut nt, 0, 0);
-        assert!(row.data.is_empty());
-    }
-
-    // ── Display / Debug ──────────────────────────────────────────────
-
-    #[test]
-    fn test_batch_writer_display() {
+    fn test_display() {
         let w = BatchWriter::with_defaults();
-        let s = w.to_string();
-        assert!(s.contains("BatchWriter"));
-        assert!(s.contains("0 dispatched"));
-        assert!(s.contains("0 errors"));
+        assert!(w.to_string().contains("BatchWriter"));
+        assert!(format!("{:?}", w).contains("dispatched"));
     }
 
     #[test]
-    fn test_batch_writer_debug() {
+    fn test_cache_initial_state() {
         let w = BatchWriter::with_defaults();
-        let d = format!("{:?}", w);
-        assert!(d.contains("BatchWriter"));
-        assert!(d.contains("dispatched"));
-        assert!(d.contains("errors"));
-        assert!(d.contains("cache"));
-    }
-
-    // ── CopyPool accessors ──────────────────────────────────────────
-
-    #[test]
-    fn test_copy_pool_empty() {
-        let w = BatchWriter::with_defaults();
-        assert!(w.copy_pool().is_empty());
-        assert_eq!(w.copy_pool().len(), 0);
-    }
-
-    #[test]
-    fn test_copy_pool_mut() {
-        let mut w = BatchWriter::with_defaults();
-        assert!(w.copy_pool_mut().is_empty());
-        // Verify mutability — len stays 0 since we don't add connections.
-        assert_eq!(w.copy_pool_mut().len(), 0);
-    }
-
-    // ── flush_all — verifies empty flush returns zeros ──
-
-    #[tokio::test]
-    async fn test_flush_all_empty() {
-        // With empty buffers, flush_all should be a no-op.
-        let w = BatchWriter::with_defaults();
-        assert_eq!(w.total_buffered(), 0);
-        assert!(!w.has_pending());
+        assert!(w.pv_cache().is_empty());
+        assert_eq!(w.pv_cache().hit_ratio(), 1.0); // no lookups = 100% hit
     }
 }

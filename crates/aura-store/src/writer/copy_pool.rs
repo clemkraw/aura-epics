@@ -2,14 +2,14 @@
 //!
 //! # Design
 //!
-//! A fixed set of N connections (default 8) serves all writer types.
+//! A fixed set of N connections serves all writer types.
 //! Each writer receives the full pool and decides how many connections to use based on its batch size:
 //!
 //! - **Scalar** (hot path): uses ALL N connections for N-way parallel COPY.
 //!
 //! - **Secondary writers** (string, array, json, image): each assigned a
 //!   preferred connection index to avoid contention. If their preferred
-//!   connection is busy with scalar COPY, tokio-postgres multiplexes automatically — zero blocking.
+//!   connection is busy, tokio-postgres multiplexes automatically — zero blocking.
 //!
 //! # Concurrency Model
 //!
@@ -19,9 +19,6 @@
 
 use aura_core::error::{AuraError, AuraResult};
 use std::sync::Arc;
-
-/// Default number of connections.
-pub const DEFAULT_POOL_SIZE: usize = 8;
 
 /// Pool of tokio-postgres connections for COPY operations.
 ///
@@ -65,16 +62,12 @@ impl CopyPool {
         &self.clients[i % self.clients.len()]
     }
 
-    /// Get all connections as a slice.
     #[inline]
     pub fn all(&self) -> &[Arc<tokio_postgres::Client>] {
         &self.clients
     }
 
-    /// Send a COPY payload (binary or text) on connection `i`.
-    ///
-    /// Zero-copy: `Bytes::from(payload)` transfers ownership to the
-    /// TCP socket without memcpy.
+    /// Send a COPY payload on connection `i`.
     pub async fn send_copy(
         &self,
         conn_idx: usize,
@@ -100,10 +93,33 @@ impl CopyPool {
         Ok(())
     }
 
+    /// Send a COPY payload as Bytes (caller keeps buffer capacity for reuse).
+    pub async fn send_copy_bytes(
+        &self,
+        conn_idx: usize,
+        sql: &str,
+        payload: bytes::Bytes,
+        row_count: usize,
+    ) -> AuraResult<()> {
+        use futures_util::SinkExt;
+        let client = self.get(conn_idx);
+        let sink = client
+            .copy_in::<_, bytes::Bytes>(sql)
+            .await
+            .map_err(|e| AuraError::database(format!("COPY begin (conn {conn_idx}): {e}")))?;
+        let mut sink = std::pin::pin!(sink);
+        sink.send(payload).await.map_err(|e| {
+            AuraError::database(format!(
+                "COPY send ({row_count} rows, conn {conn_idx}): {e}"
+            ))
+        })?;
+        sink.close()
+            .await
+            .map_err(|e| AuraError::database(format!("COPY close (conn {conn_idx}): {e}")))?;
+        Ok(())
+    }
+
     /// Send N COPY payloads in parallel, one per connection (round-robin).
-    ///
-    /// Used by scalar writer for N-way parallel flush.
-    /// Each payload goes to connection `i % pool_size`.
     pub async fn send_parallel(
         &self,
         sql: &'static str,
@@ -140,8 +156,7 @@ impl CopyPool {
     }
 
     /// Execute a parameterized query on connection `i`.
-    ///
-    /// Used by image writer for individual INSERTs (BYTEA columns don't benefit from COPY).
+    /// Used by pv_cache for metadata lookups/inserts.
     pub async fn execute(
         &self,
         conn_idx: usize,
@@ -212,34 +227,9 @@ impl std::fmt::Display for PushResult {
     }
 }
 
-/// Escape a string for PostgreSQL COPY text format.
-///
-/// Fast path: if no special chars, appends directly without char scan.
-#[inline]
-pub fn escape_copy_text(value: &str, out: &mut String) {
-    if !value
-        .bytes()
-        .any(|b| b == b'\\' || b == b'\t' || b == b'\n' || b == b'\r')
-    {
-        out.push_str(value);
-        return;
-    }
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            _ => out.push(ch),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── PushResult ───────────────────────────────────────────────
 
     #[test]
     fn push_accepted() {
@@ -261,36 +251,12 @@ mod tests {
     }
 
     #[test]
-    fn push_eq() {
-        assert_eq!(PushResult::Full, PushResult::Full);
-        assert_ne!(PushResult::Full, PushResult::Accepted);
-    }
-
-    // ── Constants ────────────────────────────────────────────────
-
-    #[test]
-    fn pgcopy_header_size() {
+    fn constants() {
         assert_eq!(PGCOPY_HEADER.len(), 19);
-    }
-    #[test]
-    fn pgcopy_trailer_size() {
-        assert_eq!(PGCOPY_TRAILER.len(), 2);
-    }
-    #[test]
-    fn pgcopy_trailer_is_minus_one() {
-        let v = i16::from_be_bytes(PGCOPY_TRAILER);
-        assert_eq!(v, -1);
-    }
-    #[test]
-    fn pg_epoch() {
+        assert_eq!(PGCOPY_TRAILER, [0xff, 0xff]);
+        assert_eq!(i16::from_be_bytes(PGCOPY_TRAILER), -1);
         assert_eq!(PG_EPOCH_OFFSET_US, 946_684_800_000_000);
     }
-    #[test]
-    fn default_pool_size() {
-        assert!(DEFAULT_POOL_SIZE >= 4);
-    }
-
-    // ── CopyPool ─────────────────────────────────────────────────
 
     #[test]
     fn pool_empty() {
@@ -301,86 +267,17 @@ mod tests {
 
     #[test]
     fn pool_default() {
-        let p = CopyPool::default();
-        assert!(p.is_empty());
+        assert!(CopyPool::default().is_empty());
     }
 
     #[test]
     fn pool_clone() {
         let p = CopyPool::with_capacity(4);
-        let p2 = p.clone();
-        assert_eq!(p.len(), p2.len());
+        assert_eq!(p.len(), p.clone().len());
     }
 
     #[test]
     fn pool_debug() {
-        let d = format!("{:?}", CopyPool::new());
-        assert!(d.contains("CopyPool") && d.contains("0"));
-    }
-
-    // ── Escape ───────────────────────────────────────────────────
-
-    #[test]
-    fn escape_plain() {
-        let mut o = String::new();
-        escape_copy_text("hello world", &mut o);
-        assert_eq!(o, "hello world");
-    }
-
-    #[test]
-    fn escape_tab() {
-        let mut o = String::new();
-        escape_copy_text("a\tb", &mut o);
-        assert_eq!(o, "a\\tb");
-    }
-
-    #[test]
-    fn escape_newline() {
-        let mut o = String::new();
-        escape_copy_text("a\nb", &mut o);
-        assert_eq!(o, "a\\nb");
-    }
-
-    #[test]
-    fn escape_cr() {
-        let mut o = String::new();
-        escape_copy_text("a\rb", &mut o);
-        assert_eq!(o, "a\\rb");
-    }
-
-    #[test]
-    fn escape_backslash() {
-        let mut o = String::new();
-        escape_copy_text("a\\b", &mut o);
-        assert_eq!(o, "a\\\\b");
-    }
-
-    #[test]
-    fn escape_combined() {
-        let mut o = String::new();
-        escape_copy_text("a\t\n\r\\b", &mut o);
-        assert_eq!(o, "a\\t\\n\\r\\\\b");
-    }
-
-    #[test]
-    fn escape_empty() {
-        let mut o = String::new();
-        escape_copy_text("", &mut o);
-        assert_eq!(o, "");
-    }
-
-    #[test]
-    fn escape_unicode() {
-        let mut o = String::new();
-        escape_copy_text("température: 4.2°K", &mut o);
-        assert_eq!(o, "température: 4.2°K");
-    }
-
-    #[test]
-    fn escape_fast_path_no_scan() {
-        let mut o = String::new();
-        let big = "a".repeat(10_000);
-        escape_copy_text(&big, &mut o);
-        assert_eq!(o.len(), 10_000);
+        assert!(format!("{:?}", CopyPool::new()).contains("CopyPool"));
     }
 }

@@ -13,7 +13,7 @@ pub enum PvChange {
     Added(PvConfig),
     /// PV removed (or disabled).
     Removed(String),
-    /// PV config modified (epsilon, heartbeat, etc.).
+    /// PV config modified (heartbeat, expected_ioc, etc.).
     Modified(PvConfig),
 }
 
@@ -124,8 +124,7 @@ impl Default for ConfigPoller {
 /// Ignores updated_at (always changes) and created_at (immutable).
 #[inline]
 fn config_changed(old: &PvConfig, new: &PvConfig) -> bool {
-    old.epsilon != new.epsilon
-        || old.heartbeat_s != new.heartbeat_s
+    old.heartbeat_s != new.heartbeat_s
         || old.enabled != new.enabled
         || old.expected_ioc != new.expected_ioc
 }
@@ -152,10 +151,6 @@ mod tests {
         PvConfig::new(name)
     }
 
-    fn pv_eps(name: &str, eps: f64) -> PvConfig {
-        PvConfig::new(name).with_epsilon(eps)
-    }
-
     fn pv_disabled(name: &str) -> PvConfig {
         PvConfig::new(name).with_enabled(false)
     }
@@ -172,7 +167,6 @@ mod tests {
     fn test_new() {
         assert_eq!(ConfigPoller::new().tracked_count(), 0);
     }
-
     #[test]
     fn test_default() {
         assert_eq!(ConfigPoller::default().tracked_count(), 0);
@@ -237,15 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_modify_epsilon() {
-        let mut p = ConfigPoller::new();
-        p.load_initial(vec![pv("A")]);
-        let changes = p.diff(vec![pv_eps("A", 0.5)]);
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], PvChange::Modified(_)));
-    }
-
-    #[test]
     fn test_diff_modify_heartbeat() {
         let mut p = ConfigPoller::new();
         p.load_initial(vec![pv("A")]);
@@ -270,7 +255,7 @@ mod tests {
     fn test_diff_mixed() {
         let mut p = ConfigPoller::new();
         p.load_initial(vec![pv("A"), pv("B"), pv("C")]);
-        let changes = p.diff(vec![pv("A"), pv_eps("C", 0.1), pv("D")]);
+        let changes = p.diff(vec![pv("A"), pv_hb("C", 30.0), pv("D")]);
         assert_eq!(
             changes
                 .iter()
@@ -329,7 +314,6 @@ mod tests {
     fn test_display() {
         assert!(ConfigPoller::new().to_string().contains("ConfigPoller"));
     }
-
     #[test]
     fn test_debug() {
         assert!(format!("{:?}", ConfigPoller::new()).contains("ConfigPoller"));

@@ -13,39 +13,39 @@ use aura_core::AlertLevel;
 use aura_core::error::{AuraError, AuraResult};
 
 mod sql {
-    pub const INSERT: &str = "INSERT INTO alert_log (level, source, category, pv_name, ioc_guid, message, details) \
+    pub const INSERT: &str = "INSERT INTO alert_log (level, source, category, pv_name, ioc_addr, message, details) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id";
 
-    pub const INSERT_UNNEST: &str = "INSERT INTO alert_log (level, source, category, pv_name, ioc_guid, message, details) \
+    pub const INSERT_UNNEST: &str = "INSERT INTO alert_log (level, source, category, pv_name, ioc_addr, message, details) \
          SELECT * FROM UNNEST(\
            $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::jsonb[]\
          ) RETURNING id";
 
-    pub const RECENT: &str = "SELECT id, time, level, source, category, pv_name, ioc_guid, \
+    pub const RECENT: &str = "SELECT id, time, level, source, category, pv_name, ioc_addr, \
          message, details, acknowledged \
          FROM alert_log ORDER BY time DESC LIMIT $1";
 
-    pub const UNACKED: &str = "SELECT id, time, level, source, category, pv_name, ioc_guid, \
+    pub const UNACKED: &str = "SELECT id, time, level, source, category, pv_name, ioc_addr, \
          message, details, acknowledged \
          FROM alert_log WHERE acknowledged = FALSE \
          ORDER BY time DESC LIMIT $1";
 
-    pub const BY_TIME_RANGE: &str = "SELECT id, time, level, source, category, pv_name, ioc_guid, \
+    pub const BY_TIME_RANGE: &str = "SELECT id, time, level, source, category, pv_name, ioc_addr, \
          message, details, acknowledged \
          FROM alert_log WHERE time >= $1 AND time < $2 \
          ORDER BY time DESC LIMIT $3";
 
-    pub const BY_LEVEL: &str = "SELECT id, time, level, source, category, pv_name, ioc_guid, \
+    pub const BY_LEVEL: &str = "SELECT id, time, level, source, category, pv_name, ioc_addr, \
          message, details, acknowledged \
          FROM alert_log WHERE level = $1 \
          ORDER BY time DESC LIMIT $2";
 
-    pub const BY_CATEGORY: &str = "SELECT id, time, level, source, category, pv_name, ioc_guid, \
+    pub const BY_CATEGORY: &str = "SELECT id, time, level, source, category, pv_name, ioc_addr, \
          message, details, acknowledged \
          FROM alert_log WHERE category = $1 \
          ORDER BY time DESC LIMIT $2";
 
-    pub const BY_PV: &str = "SELECT id, time, level, source, category, pv_name, ioc_guid, \
+    pub const BY_PV: &str = "SELECT id, time, level, source, category, pv_name, ioc_addr, \
          message, details, acknowledged \
          FROM alert_log WHERE pv_name = $1 \
          ORDER BY time DESC LIMIT $2";
@@ -121,7 +121,7 @@ pub struct Alert {
     pub source: Cow<'static, str>,
     pub category: AlertCategory,
     pub pv_name: Option<Cow<'static, str>>,
-    pub ioc_guid: Option<Cow<'static, str>>,
+    pub ioc_addr: Option<Cow<'static, str>>,
     pub message: String,
     pub details: serde_json::Value,
 }
@@ -134,7 +134,7 @@ impl Alert {
             category,
             source: Cow::Borrowed(sources::STORE),
             pv_name: None,
-            ioc_guid: None,
+            ioc_addr: None,
             message: message.into(),
             details: serde_json::Value::Object(Default::default()),
         }
@@ -163,8 +163,8 @@ impl Alert {
         self
     }
 
-    pub fn with_ioc(mut self, guid: impl Into<String>) -> Self {
-        self.ioc_guid = Some(Cow::Owned(guid.into()));
+    pub fn with_ioc(mut self, addr: impl Into<String>) -> Self {
+        self.ioc_addr = Some(Cow::Owned(addr.into()));
         self
     }
 
@@ -183,7 +183,7 @@ impl Alert {
             Cow::Borrowed(_) => 0,
             Cow::Owned(s) => s.len() + 24,
         });
-        let ioc_heap = self.ioc_guid.as_ref().map_or(0, |c| match c {
+        let ioc_heap = self.ioc_addr.as_ref().map_or(0, |c| match c {
             Cow::Borrowed(_) => 0,
             Cow::Owned(s) => s.len() + 24,
         });
@@ -211,7 +211,7 @@ pub struct StoredAlert {
     pub source: String,
     pub category: AlertCategory,
     pub pv_name: Option<String>,
-    pub ioc_guid: Option<String>,
+    pub ioc_addr: Option<String>,
     pub message: String,
     pub details: serde_json::Value,
     pub acknowledged: bool,
@@ -284,7 +284,7 @@ struct AlertRow {
     source: String,
     category: String,
     pv_name: Option<String>,
-    ioc_guid: Option<String>,
+    ioc_addr: Option<String>,
     message: String,
     details: serde_json::Value,
     acknowledged: bool,
@@ -315,7 +315,7 @@ impl AlertRow {
             source: self.source, // moved
             category,
             pv_name: self.pv_name,   // moved
-            ioc_guid: self.ioc_guid, // moved
+            ioc_addr: self.ioc_addr, // moved
             message: self.message,   // moved
             details: self.details,   // moved
             acknowledged: self.acknowledged,
@@ -340,7 +340,7 @@ impl AlertDao {
             .bind(alert.source.as_ref())
             .bind(alert.category.as_str())
             .bind(alert.pv_name.as_deref())
-            .bind(alert.ioc_guid.as_deref())
+            .bind(alert.ioc_addr.as_deref())
             .bind(&alert.message)
             .bind(&alert.details)
             .fetch_one(pool)
@@ -360,7 +360,7 @@ impl AlertDao {
         let mut sources_v = Vec::with_capacity(n);
         let mut categories = Vec::with_capacity(n);
         let mut pv_names: Vec<Option<&str>> = Vec::with_capacity(n);
-        let mut ioc_guids: Vec<Option<&str>> = Vec::with_capacity(n);
+        let mut ioc_addrs: Vec<Option<&str>> = Vec::with_capacity(n);
         let mut messages = Vec::with_capacity(n);
         let mut details_v: Vec<&serde_json::Value> = Vec::with_capacity(n);
 
@@ -369,7 +369,7 @@ impl AlertDao {
             sources_v.push(a.source.as_ref());
             categories.push(a.category.as_str());
             pv_names.push(a.pv_name.as_deref());
-            ioc_guids.push(a.ioc_guid.as_deref());
+            ioc_addrs.push(a.ioc_addr.as_deref());
             messages.push(a.message.as_str());
             details_v.push(&a.details);
         }
@@ -379,7 +379,7 @@ impl AlertDao {
             .bind(&sources_v)
             .bind(&categories)
             .bind(&pv_names)
-            .bind(&ioc_guids)
+            .bind(&ioc_addrs)
             .bind(&messages)
             .bind(&details_v)
             .fetch_all(pool)
@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(a.message, "PV not connected");
         assert_eq!(a.source.as_ref(), "store"); // static borrow
         assert!(a.pv_name.is_none());
-        assert!(a.ioc_guid.is_none());
+        assert!(a.ioc_addr.is_none());
         assert!(a.details.is_object());
     }
 
@@ -699,12 +699,12 @@ mod tests {
         let a = Alert::new(AlertLevel::Critical, AlertCategory::Ioc, "IOC offline")
             .with_source_static(sources::DISCOVER)
             .with_pv("CRYO:TEMP")
-            .with_ioc("guid-abc")
+            .with_ioc("addr-abc")
             .with_details(json!({"last_seen": "2026-01-01"}));
 
         assert_eq!(a.source.as_ref(), "discover");
         assert_eq!(a.pv_name.as_deref(), Some("CRYO:TEMP"));
-        assert_eq!(a.ioc_guid.as_deref(), Some("guid-abc"));
+        assert_eq!(a.ioc_addr.as_deref(), Some("addr-abc"));
         assert_eq!(a.details["last_seen"], "2026-01-01");
     }
 
@@ -739,7 +739,7 @@ mod tests {
         let small = Alert::new(AlertLevel::Info, AlertCategory::System, "ok");
         let large = Alert::new(AlertLevel::Critical, AlertCategory::Pv, "x".repeat(1000))
             .with_pv("VERY:LONG:PV:NAME")
-            .with_ioc("guid-12345678")
+            .with_ioc("addr-12345678")
             .with_details(json!({"data": [1,2,3,4,5]}));
         assert!(large.mem_size() > small.mem_size());
     }
@@ -752,7 +752,7 @@ mod tests {
             source: "test".to_string(),
             category: AlertCategory::System,
             pv_name: None,
-            ioc_guid: None,
+            ioc_addr: None,
             message: "test".to_string(),
             details: json!({}),
             acknowledged: acked,
@@ -780,7 +780,7 @@ mod tests {
             source: "discover".to_string(),
             category: AlertCategory::Ioc,
             pv_name: None,
-            ioc_guid: None,
+            ioc_addr: None,
             message: "IOC lost".to_string(),
             details: json!({}),
             acknowledged: false,
@@ -856,7 +856,7 @@ mod tests {
             source: "discover".to_string(),
             category: "ioc".to_string(),
             pv_name: Some("PV:A".to_string()),
-            ioc_guid: Some("guid-x".to_string()),
+            ioc_addr: Some("addr-x".to_string()),
             message: "IOC offline".to_string(),
             details: json!({"k": 1}),
             acknowledged: true,
@@ -877,7 +877,7 @@ mod tests {
             source: "x".to_string(),
             category: "system".to_string(),
             pv_name: None,
-            ioc_guid: None,
+            ioc_addr: None,
             message: "test".to_string(),
             details: json!({}),
             acknowledged: false,
@@ -896,7 +896,7 @@ mod tests {
             source: "x".to_string(),
             category: "nonsense".to_string(),
             pv_name: None,
-            ioc_guid: None,
+            ioc_addr: None,
             message: "test".to_string(),
             details: json!({}),
             acknowledged: false,

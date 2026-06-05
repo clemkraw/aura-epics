@@ -2,10 +2,10 @@
 -- 002_pv_lookup: PV name ↔ numeric ID normalization.
 -- ═══════════════════════════════════════════════════════════════════════
 
-CREATE TABLE IF NOT EXISTS pv_lookup (
-    pv_id       SERIAL PRIMARY KEY,
-    pv_name     TEXT        NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+CREATE TABLE IF NOT EXISTS pv_lookup
+(
+    pv_id   SERIAL PRIMARY KEY,
+    pv_name TEXT NOT NULL,
 
     CONSTRAINT uq_pv_lookup_name UNIQUE (pv_name)
 );
@@ -13,8 +13,6 @@ CREATE TABLE IF NOT EXISTS pv_lookup (
 CREATE INDEX IF NOT EXISTS idx_pv_lookup_name
     ON pv_lookup USING hash (pv_name);
 
-CREATE INDEX IF NOT EXISTS idx_pv_lookup_created
-    ON pv_lookup (created_at);
 
 COMMENT ON TABLE pv_lookup
     IS 'PV name ↔ numeric ID normalization. Saves ~40 bytes per sample row.';

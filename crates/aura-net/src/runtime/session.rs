@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 use crate::client::connection::{ConnectionState, next_client_id};
@@ -292,10 +293,7 @@ impl FastScalarLayout {
 
     /// Read the value field as f64 from the reader.
     #[inline]
-    fn read_value(
-        &self,
-        reader: &mut PvaReader,
-    ) -> Result<f64, crate::codec::pvdata::DecodeError> {
+    fn read_value(&self, reader: &mut PvaReader) -> Result<f64, crate::codec::pvdata::DecodeError> {
         match self.value_type {
             ScalarType::Double => reader.read_f64(),
             ScalarType::Float => reader.read_f32().map(|v| v as f64),
@@ -587,15 +585,9 @@ pub struct PvaSession {
     /// Aggregated event bus - when set, events are pushed here instead of per-PV channels.
     bus_tx: Option<MonitorBusTx>,
     /// Shared buffer for metadata extraction (first full update per PV).
-    metadata_buf: Option<
-        std::sync::Arc<
-            std::sync::Mutex<Vec<(std::sync::Arc<str>, PvaValue)>>,
-        >,
-    >,
+    metadata_buf: Option<std::sync::Arc<std::sync::Mutex<Vec<(std::sync::Arc<str>, PvaValue)>>>>,
     /// Shared pv_id cache for OPT-1: resolve pv_id once per monitor, not per event.
-    pv_cache: Option<
-        std::sync::Arc<arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>>,
-    >,
+    pv_cache: Option<std::sync::Arc<arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>>>,
 }
 
 impl PvaSession {
@@ -633,18 +625,14 @@ impl PvaSession {
     /// Set the shared metadata buffer. First full update for each PV is pushed here.
     pub fn set_metadata_buf(
         &mut self,
-        buf: std::sync::Arc<
-            std::sync::Mutex<Vec<(std::sync::Arc<str>, PvaValue)>>,
-        >,
+        buf: std::sync::Arc<std::sync::Mutex<Vec<(std::sync::Arc<str>, PvaValue)>>>,
     ) {
         self.metadata_buf = Some(buf);
     }
 
     pub fn set_pv_cache(
         &mut self,
-        cache: std::sync::Arc<
-            arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>,
-        >,
+        cache: std::sync::Arc<arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>>,
     ) {
         self.pv_cache = Some(cache);
     }
@@ -827,6 +815,10 @@ impl PvaSession {
                         super::driver::SessionCommand::RemoveMonitor { pv_name } => {
                             self.remove_monitor_inline(&pv_name).await;
                         }
+                        super::driver::SessionCommand::Shutdown => {
+                           let _ = self.tcp.stream.shutdown().await;
+                           return Ok(());
+                       }
                     }
                 }
             }
@@ -920,7 +912,8 @@ impl PvaSession {
             return results;
         }
 
-        let mut id_to_pv: HashMap<i32, std::sync::Arc<str>> = HashMap::with_capacity(pv_names.len());
+        let mut id_to_pv: HashMap<i32, std::sync::Arc<str>> =
+            HashMap::with_capacity(pv_names.len());
 
         for pv in pv_names {
             let arc_pv: std::sync::Arc<str> = pv.as_str().into();
@@ -934,7 +927,8 @@ impl PvaSession {
         //
         // PVA is pipelined - send all requests at once into the TCP buffer,
         // flush once, then read all responses. 1 round-trip instead of N chunks.
-        let mut channel_map: HashMap<i32, (std::sync::Arc<str>, i32)> = HashMap::with_capacity(id_to_pv.len());
+        let mut channel_map: HashMap<i32, (std::sync::Arc<str>, i32)> =
+            HashMap::with_capacity(id_to_pv.len());
         let mut channel_failures: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
         // Send ALL CREATE_CHANNEL requests.
@@ -1341,8 +1335,7 @@ impl PvaSession {
                     let mut status = 0i32;
                     let mut seconds = 0i64;
                     let mut nanos = 0i32;
-                    let is_string =
-                        layout.value_type == ScalarType::String;
+                    let is_string = layout.value_type == ScalarType::String;
 
                     let fast_ok = (|| -> Result<(), crate::codec::pvdata::DecodeError> {
                         for bit_usize in changed.iter_set() {
