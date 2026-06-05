@@ -8,8 +8,6 @@
 --   samples_histogram  → samples_hist     (range FLOAT8 + count BIGINT per row)
 --   samples_continuum  → samples_cont     (base FLOAT8 + trace FLOAT8 per row)
 --   samples_multi      → samples_mch      (name TEXT + value FLOAT8 + ch_sev SMALLINT per row)
---
--- Old tables are kept for backward compatibility but no longer written to.
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- NAMEVALUE → samples_nv (destructured)
