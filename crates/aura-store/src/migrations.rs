@@ -1,4 +1,3 @@
-//!
 //! Migrations are embedded in the binary via `sqlx::migrate!()` and
 //! run in order on startup. This ensures the schema is always up-to-date
 //! without requiring external migration files at runtime.
@@ -8,18 +7,19 @@
 //! ```text
 //! 001_extensions              — TimescaleDB + pg_stat_statements
 //! 002_pv_lookup               — pv_id ↔ pv_name normalization table
-//! 003_pv_config               — PV archiving configuration (name, epsilon, heartbeat)
+//! 003_pv_config               — PV archiving configuration (name, heartbeat, enabled)
 //! 004_pv_metadata             — PV metadata from PVA Normative Types (units, alarms, enum choices)
 //! 005_samples                 — main scalar + string hypertables (~90% of traffic)
 //! 006_samples_typed           — per-NT-type hypertables (image, json)
 //! 007_compression             — TimescaleDB compression policies (gorilla + delta-of-delta)
 //! 008_retention               — tiered data retention (raw → downsampled → purge)
 //! 009_continuous_aggs         — hourly and daily materialized continuous aggregates
-//! 010_ioc_registry            — discovered IOC tracking (from PVA beacons)
-//! 011_alert_log               — system alert history (IOC offline, PV disconnected)
-//! 012_ingest_registry         — ingest instance heartbeat tracking
-//! 013_array_destructured      — element-per-row array tables for gorilla compression
-//! 014_destructure_json_tables — element-per-row JSON tables for gorilla compression
+//! 010_alert_log               — system alert history (IOC offline, PV disconnected)
+//! 011_array_destructured      — element-per-row array tables for gorilla compression
+//! 012_destructure_json_tables — element-per-row JSON tables for gorilla compression
+//! 013_ioc_config              — IOC server configuration (pvxs TCP, NOTIFY trigger)
+//! 014_pv_events_status        — PV connection/disconnection event tracking
+//! 015_batch_notify             — statement-level NOTIFY on pv_config changes
 //! ```
 
 use std::fmt;
@@ -84,35 +84,39 @@ impl Migrations {
         },
         MigrationStep {
             version: 10,
-            name: "ioc_registry",
-            sql: include_str!("../../../migrations/010_ioc_registry.sql"),
+            name: "alert_log",
+            sql: include_str!("../../../migrations/010_alert_log.sql"),
         },
         MigrationStep {
             version: 11,
-            name: "alert_log",
-            sql: include_str!("../../../migrations/011_alert_log.sql"),
+            name: "array_destructured",
+            sql: include_str!("../../../migrations/011_array_destructured.sql"),
         },
         MigrationStep {
             version: 12,
-            name: "ingest_registry",
-            sql: include_str!("../../../migrations/012_ingest_registry.sql"),
+            name: "destructure_json_tables",
+            sql: include_str!("../../../migrations/012_destructure_json_tables.sql"),
         },
         MigrationStep {
             version: 13,
-            name: "array_destructured",
-            sql: include_str!("../../../migrations/013_array_destructured.sql"),
+            name: "ioc_config",
+            sql: include_str!("../../../migrations/013_ioc_config.sql"),
         },
         MigrationStep {
             version: 14,
-            name: "destructure_json_tables",
-            sql: include_str!("../../../migrations/014_destructure_json_tables.sql"),
+            name: "pv_events_status",
+            sql: include_str!("../../../migrations/014_pv_events_status.sql"),
+        },
+        MigrationStep {
+            version: 15,
+            name: "batch_notify",
+            sql: include_str!("../../../migrations/015_batch_notify.sql"),
         },
     ];
 
     /// Run all migrations in order.
     ///
-    /// Uses a `_aura_migrations` table to track which migrations
-    /// have already been applied.
+    /// Uses a `_aura_migrations` table to track which migrations have already been applied.
     pub async fn run(pool: &PgPool) -> AuraResult<MigrationReport> {
         // Create the migrations tracking table if it doesn't exist.
         sqlx::query(Self::TRACKING_TABLE_SQL)
@@ -181,8 +185,8 @@ impl Migrations {
     }
 
     /// Total number of migrations.
-    pub const fn count() -> usize {
-        14
+    pub fn count() -> usize {
+        Self::ALL.len()
     }
 
     /// The SQL to create the migrations tracking table.
@@ -267,8 +271,8 @@ mod tests {
 
     #[test]
     fn test_migration_count() {
-        assert_eq!(Migrations::ALL.len(), 14);
-        assert_eq!(Migrations::count(), 14);
+        assert_eq!(Migrations::ALL.len(), 15);
+        assert_eq!(Migrations::count(), 15);
     }
 
     #[test]
@@ -366,8 +370,8 @@ mod tests {
 
     #[test]
     fn test_get_by_version_last() {
-        let step = Migrations::get(12).unwrap();
-        assert_eq!(step.name, "ingest_registry");
+        let step = Migrations::get(15).unwrap();
+        assert_eq!(step.name, "batch_notify");
     }
 
     #[test]
@@ -395,8 +399,8 @@ mod tests {
         let step = Migrations::get(1).unwrap();
         assert_eq!(step.to_string(), "001_extensions");
 
-        let step = Migrations::get(12).unwrap();
-        assert_eq!(step.to_string(), "012_ingest_registry");
+        let step = Migrations::get(15).unwrap();
+        assert_eq!(step.to_string(), "015_batch_notify");
     }
 
     #[test]
@@ -424,11 +428,12 @@ mod tests {
                 "compression",
                 "retention",
                 "continuous_aggs",
-                "ioc_registry",
                 "alert_log",
-                "ingest_registry",
                 "array_destructured",
-                "destructure_json_tables"
+                "destructure_json_tables",
+                "ioc_config",
+                "pv_events_status",
+                "batch_notify",
             ]
         );
     }
