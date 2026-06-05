@@ -3,35 +3,48 @@ services:
     image: timescale/timescaledb:2.26.3-pg18
     container_name: aura-db
     restart: always
+    network_mode: "host"
+    shm_size: '18g'
     environment:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-    ports:
-      - "${POSTGRES_PORT}:5432"
+      - NO_TS_TUNE=true
+      - PGDATA=/var/lib/postgresql/data/pgdata&
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - aura_db_data:/var/lib/postgresql/data
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U aura -d aura"]
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 3
 
   redis:
     image: redis:8.6.2
     container_name: aura-redis
     restart: always
-    command: redis-server --appendonly yes
-    ports:
-      - "${REDIS_PORT}:6379"
-    volumes:
-      - aura_redis_data:/data
+    network_mode: "host"
+    command: >
+      redis-server
+      --appendonly no
+      --save ""
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
       retries: 5
 
 volumes:
   aura_db_data:
-  aura_redis_data:
