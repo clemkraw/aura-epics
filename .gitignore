@@ -1,3 +1,5 @@
+/.idea
+/.vscode
 /target
 data/
 
@@ -9,3 +11,5 @@ crates/aura-discover/target
 crates/aura-ingest/target
 crates/aura-net/target
 crates/aura-store/target
+
+/config/aura.toml
