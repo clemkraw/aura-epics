@@ -21,7 +21,7 @@
     <img src="https://img.shields.io/badge/runtime-Tokio-blue?style=flat-square" alt="Tokio">
     <img src="https://img.shields.io/badge/storage-TimeScaleDB-green?style=flat-square" alt="TimeScaleDB">
     <img src="https://img.shields.io/badge/protocol-PV%20Access-blueviolet?style=flat-square" alt="CA">
-    <img src="https://img.shields.io/badge/license-MIT-lightgrey?style=flat-square" alt="License">
+    <img src="https://img.shields.io/badge/license--lightgrey?style=flat-square" alt="License">
   </p>
 </div>
 
@@ -30,7 +30,3 @@
 ## Contributing
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a pull request.
-
-## License
-
-AURA-EPICS is licensed under the [MIT License](LICENSE).
