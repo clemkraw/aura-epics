@@ -10,7 +10,7 @@ services:
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - NO_TS_TUNE=true
-      - PGDATA=/var/lib/postgresql/data/pgdata&
+      - PGDATA=/var/lib/postgresql/data/pgdata
     command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
     ulimits:
       nofile:
@@ -20,7 +20,7 @@ services:
       - aura_db_data:/var/lib/postgresql/data
       - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aura -d aura"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 3

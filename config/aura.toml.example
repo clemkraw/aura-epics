@@ -9,7 +9,7 @@ max_connections = 5
 
 # --- EPICS network monitoring ---
 [discover]
-name_servers = ["172.17.134.230:5075"]
+name_servers = ["192.0.2.10:5075"]
 config_poll_interval_s = 30       # Check for PV modifications in DB every 30s
 
 # --- PV Ingestion ---
