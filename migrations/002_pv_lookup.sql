@@ -10,10 +10,6 @@ CREATE TABLE IF NOT EXISTS pv_lookup
     CONSTRAINT uq_pv_lookup_name UNIQUE (pv_name)
 );
 
-CREATE INDEX IF NOT EXISTS idx_pv_lookup_name
-    ON pv_lookup USING hash (pv_name);
-
-
 COMMENT ON TABLE pv_lookup
     IS 'PV name ↔ numeric ID normalization. Saves ~40 bytes per sample row.';
 
