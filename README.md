@@ -102,37 +102,37 @@ component of NTNDArray rather than as standalone archivable PVs).
 ## Architecture
 
 ```md
-┌─────────────────────────────────────────────────────────────────────────┐
-│ AURA-EPICS Binary │
-│ ------------------- │
-│ │
-│ ┌───────────┐ ┌──────────────┐ ┌───────────────────────────────┐ │
-│ │ │ │ │ │ aura-store │ │
-│ │ aura-net │-->│ aura-ingest │--->│ │ │
-│ │ │ │ │ │ SharedBuffer ---> store_loop │ │
-│ │ pvxs │ │ N threads │ │ | | │ │
-│ │ TCP │ │ ScalarDelta │ │ v v │ │
-│ │ sessions │ │ fast path │ │ ScalarWriter JsonWriter │ │
-│ │ │ │ │ │ StringWriter ImageWriter │ │
-│ └───────────┘ └──────────────┘ │ ArrayWriter │ │
-│ │ | │ │
-│ ┌──────────────┐ │ v │ │
-│ │ aura-discover│ │ CopyPool (N connections)     │ │
-│ │ │ │ | │ │
-│ │ config_poller│ │ v │ │
-│ │ pg_notify │ │ Binary COPY ---> TimescaleDB │ │
-│ └──────────────┘ └───────────────────────────────┘ │
-│ │
-│ ┌──────────┐ │
-│ │aura-core │ Shared types, config, error handling, PVA codec │
-│ └──────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-^ |
-| pvxs TCP | discovery
-v v commands
-┌──────────┐ ┌──────────┐
-│ IOCs │ │ Redis │
-└──────────┘ └──────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         AURA-EPICS Binary                            │
+│                        -------------------                           │
+│                                                                      │
+│  ┌──────────┐   ┌──────────────┐    ┌──────────────────────────────┐ │
+│  │          │   │              │    │         aura-store           │ │
+│  │ aura-net │-->│ aura-ingest  │--->│                              │ │
+│  │          │   │              │    │  SharedBuffer ---> store_loop│ │
+│  │  pvxs    │   │  N threads   │    │       |              |       │ │
+│  │  TCP     │   │  ScalarDelta │    │       v              v       │ │
+│  │  sessions│   │  fast path   │    │  ScalarWriter   JsonWriter   │ │
+│  │          │   │              │    │  StringWriter   ImageWriter  │ │
+│  └──────────┘   └──────────────┘    │  ArrayWriter                 │ │
+│                                     │       |                      │ │
+│  ┌──────────────┐                   │       v                      │ │
+│  │ aura-discover│                   │  CopyPool (N connections)    │ │
+│  │              │                   │       |                      │ │
+│  │ config_poller│                   │       v                      │ │
+│  │ pg_notify    │                   │  Binary COPY ---> TimescaleDB│ │
+│  └──────────────┘                   └──────────────────────────────┘ │
+│                                                                      │
+│  ┌──────────┐                                                        │
+│  │aura-core │  Shared types, config, error handling, PVA codec       │
+│  └──────────┘                                                        │
+└──────────────────────────────────────────────────────────────────────┘
+      ^                                          |
+      | pvxs TCP                                 | discovery
+      v                                          v commands
+┌──────────┐                                ┌──────────┐
+│   IOCs   │                                │  Redis   │
+└──────────┘                                └──────────┘
 ```
 
 ### Crate Responsibilities
