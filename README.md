@@ -379,7 +379,3 @@ beyond this initial framework.
 ## Contributing
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a pull request.
-
-## License
-
-AURA-EPICS is licensed under the [MIT License](LICENSE).
