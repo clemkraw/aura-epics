@@ -370,7 +370,7 @@ AURA-EPICS was originally initiated at [IJCLab](https://www.ijclab.in2p3.fr/) (L
 Irène
 Joliot-Curie), a joint laboratory of CNRS/IN2P3 and Université Paris-Saclay, during an internship focused on the control
 and data acquisition
-needs of the [PERLE](https://perle.ijclab.in2p3.fr/) particle accelerator project (Powerful Energy Recovery Linac for
+needs of the [PERLE](https://perle-web.ijclab.in2p3.fr/) particle accelerator project (Powerful Energy Recovery Linac for
 Experiments). Development has since continued
 beyond this initial framework.
 
