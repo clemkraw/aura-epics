@@ -7,11 +7,11 @@ CREATE TABLE IF NOT EXISTS pv_config
     pv_name      TEXT PRIMARY KEY,
     description  TEXT,
     unit         TEXT,
-    heartbeat_s  DOUBLE PRECISION NOT NULL DEFAULT 0.0, -- 0 = use global default from aura.toml
-    expected_ioc TEXT,                                  -- expected IOC address (for connection routing)
-    enabled      BOOLEAN          NOT NULL DEFAULT TRUE,
-    created_at   TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
-    updated_at   TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+    heartbeat_s  DOUBLE PRECISION     DEFAULT NULL, -- NULL = global default (aura.toml), 0 = disabled for this PV, > 0 = override
+    expected_ioc TEXT,                              -- expected IOC address (for connection routing)
+    enabled      BOOLEAN     NOT NULL DEFAULT TRUE,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Auto-update updated_at on any modification.
@@ -49,4 +49,4 @@ CREATE INDEX IF NOT EXISTS idx_pv_config_updated
     ON pv_config (updated_at);
 
 COMMENT ON TABLE pv_config IS 'PV archiving configuration. Polled by aura-discover.';
-COMMENT ON COLUMN pv_config.heartbeat_s IS 'Max seconds between forced stores. 0 = use global default from aura.toml.';
+COMMENT ON COLUMN pv_config.heartbeat_s IS 'Max seconds between forced stores. NULL = use global default from aura.toml, 0 = heartbeat disabled for this PV, > 0 = per-PV override.';
