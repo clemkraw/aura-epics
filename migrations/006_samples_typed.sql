@@ -26,14 +26,14 @@ SELECT create_hypertable('samples_table', 'time',
 
 
 
-CREATE INDEX IF NOT EXISTS idx_samples_table_pv_brin
-    ON samples_table USING brin (pv_id, time)
-    WITH (pages_per_range = 32);
+-- Low row-rate table: btree (pv_id, time) is affordable and makes
+-- single-PV queries instant on the uncompressed tail.
+CREATE INDEX IF NOT EXISTS idx_samples_table_pv_time
+    ON samples_table (pv_id, time DESC);
 
 -- ─── Image / NDArray (NTNDArray) ────────────────────────────────────
 -- Camera/detector frames. Largest data per row.
 -- Stored as BYTEA (raw or compressed by the IOC codec).
--- Separate 1-day chunks + 30-day retention (vs 90 for scalars).
 CREATE TABLE IF NOT EXISTS samples_image
 (
     time              TIMESTAMPTZ NOT NULL,
@@ -62,9 +62,8 @@ ALTER TABLE samples_image
 
 
 
-CREATE INDEX IF NOT EXISTS idx_samples_image_pv_brin
-    ON samples_image USING brin (pv_id, time)
-    WITH (pages_per_range = 32);
+CREATE INDEX IF NOT EXISTS idx_samples_image_pv_time
+    ON samples_image (pv_id, time DESC);
 
 -- ─── Custom / Union (NTUnion, Custom) ───────────────────────────────
 -- Catch-all for non-standard structures. Stored as JSONB.
@@ -85,10 +84,9 @@ SELECT create_hypertable('samples_custom', 'time',
 
 
 
-CREATE INDEX IF NOT EXISTS idx_samples_custom_pv_brin
-    ON samples_custom USING brin (pv_id, time)
-    WITH (pages_per_range = 32);
+CREATE INDEX IF NOT EXISTS idx_samples_custom_pv_time
+    ON samples_custom (pv_id, time DESC);
 
 COMMENT ON TABLE samples_table IS 'Columnar table data stored as JSONB.';
-COMMENT ON TABLE samples_image IS 'Camera/detector frames. BYTEA with codec info. 30-day retention.';
+COMMENT ON TABLE samples_image IS 'Camera/detector frames. BYTEA with codec info. 90-day retention (see 008).';
 COMMENT ON TABLE samples_custom IS 'Non-standard structures stored as JSONB.';
