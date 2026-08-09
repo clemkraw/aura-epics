@@ -30,15 +30,16 @@ SELECT create_hypertable('samples_nv', 'time',
                          if_not_exists => TRUE
        );
 
-CREATE INDEX IF NOT EXISTS idx_nv_pv_brin
-    ON samples_nv USING brin (pv_id, time)
+CREATE INDEX IF NOT EXISTS idx_nv_time_brin
+    ON samples_nv USING brin (time)
     WITH (pages_per_range = 32);
 
 ALTER TABLE samples_nv
     SET (
         timescaledb.compress,
         timescaledb.compress_segmentby = 'pv_id',
-        timescaledb.compress_orderby = 'time DESC, capture_id DESC, idx'
+        timescaledb.compress_orderby = 'time DESC, capture_id DESC, idx',
+        timescaledb.compress_chunk_time_interval = '24 hours'
         );
 
 SELECT add_compression_policy('samples_nv', INTERVAL '2 hours',
@@ -65,15 +66,16 @@ SELECT create_hypertable('samples_hist', 'time',
                          if_not_exists => TRUE
        );
 
-CREATE INDEX IF NOT EXISTS idx_hist_pv_brin
-    ON samples_hist USING brin (pv_id, time)
+CREATE INDEX IF NOT EXISTS idx_hist_time_brin
+    ON samples_hist USING brin (time)
     WITH (pages_per_range = 32);
 
 ALTER TABLE samples_hist
     SET (
         timescaledb.compress,
         timescaledb.compress_segmentby = 'pv_id',
-        timescaledb.compress_orderby = 'time DESC, capture_id DESC, idx'
+        timescaledb.compress_orderby = 'time DESC, capture_id DESC, idx',
+        timescaledb.compress_chunk_time_interval = '24 hours'
         );
 
 SELECT add_compression_policy('samples_hist', INTERVAL '2 hours',
@@ -100,15 +102,16 @@ SELECT create_hypertable('samples_cont', 'time',
                          if_not_exists => TRUE
        );
 
-CREATE INDEX IF NOT EXISTS idx_cont_pv_brin
-    ON samples_cont USING brin (pv_id, time)
+CREATE INDEX IF NOT EXISTS idx_cont_time_brin
+    ON samples_cont USING brin (time)
     WITH (pages_per_range = 32);
 
 ALTER TABLE samples_cont
     SET (
         timescaledb.compress,
         timescaledb.compress_segmentby = 'pv_id',
-        timescaledb.compress_orderby = 'time DESC, capture_id DESC, idx'
+        timescaledb.compress_orderby = 'time DESC, capture_id DESC, idx',
+        timescaledb.compress_chunk_time_interval = '24 hours'
         );
 
 SELECT add_compression_policy('samples_cont', INTERVAL '2 hours',
@@ -136,28 +139,29 @@ SELECT create_hypertable('samples_mch', 'time',
                          if_not_exists => TRUE
        );
 
-CREATE INDEX IF NOT EXISTS idx_mch_pv_brin
-    ON samples_mch USING brin (pv_id, time)
+CREATE INDEX IF NOT EXISTS idx_mch_time_brin
+    ON samples_mch USING brin (time)
     WITH (pages_per_range = 32);
 
 ALTER TABLE samples_mch
     SET (
         timescaledb.compress,
         timescaledb.compress_segmentby = 'pv_id',
-        timescaledb.compress_orderby = 'time DESC, capture_id DESC, idx'
+        timescaledb.compress_orderby = 'time DESC, capture_id DESC, idx',
+        timescaledb.compress_chunk_time_interval = '24 hours'
         );
 
 SELECT add_compression_policy('samples_mch', INTERVAL '2 hours',
                               if_not_exists => TRUE);
 
--- ─── Retention (60-90 days) ────────────────────────────────────────
+-- ─── Retention (90 days — aligned with the global lossless window) ──
 SELECT add_retention_policy('samples_nv', INTERVAL '90 days',
                             if_not_exists => TRUE);
 
-SELECT add_retention_policy('samples_hist', INTERVAL '60 days',
+SELECT add_retention_policy('samples_hist', INTERVAL '90 days',
                             if_not_exists => TRUE);
 
-SELECT add_retention_policy('samples_cont', INTERVAL '60 days',
+SELECT add_retention_policy('samples_cont', INTERVAL '90 days',
                             if_not_exists => TRUE);
 
 SELECT add_retention_policy('samples_mch', INTERVAL '90 days',
