@@ -13,7 +13,7 @@
 CREATE TABLE IF NOT EXISTS pv_metadata
 (
     pv_name          TEXT PRIMARY KEY,
-    pv_id            INTEGER          REFERENCES pv_lookup (pv_id) ON DELETE SET NULL,
+    pv_id            INTEGER          REFERENCES pv_lookup (pv_id) ON DELETE RESTRICT,
     data_type        TEXT             NOT NULL, -- PvDataType: "Scalar", "Array", "Image", etc.
     scalar_type      TEXT,                      -- ScalarType: "Double", "Int", etc.
     array_size       INTEGER,

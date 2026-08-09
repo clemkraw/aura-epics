@@ -38,8 +38,7 @@ ALTER TABLE pv_events
 SELECT add_compression_policy('pv_events', INTERVAL '24 hours',
                               if_not_exists => TRUE);
 
--- Retention: 90 days of lifecycle history.
-SELECT add_retention_policy('pv_events', INTERVAL '90 days',
+SELECT add_retention_policy('pv_events', INTERVAL '365 days',
                             if_not_exists => TRUE);
 
 CREATE TABLE IF NOT EXISTS pv_status
@@ -57,6 +56,22 @@ CREATE TABLE IF NOT EXISTS pv_status
     last_value    DOUBLE PRECISION,
     last_severity SMALLINT NOT NULL DEFAULT 0,
     health_score  REAL     NOT NULL DEFAULT 1.0
-);
+)
+
+    WITH (fillfactor = 70);
+
+
+ALTER TABLE pv_status
+    SET (
+        autovacuum_vacuum_scale_factor = 0.02,
+        autovacuum_vacuum_threshold = 500,
+        autovacuum_vacuum_cost_delay = 0, -- full speed on this small table
+        autovacuum_analyze_scale_factor = 0.05
+        );
+
 CREATE INDEX IF NOT EXISTS idx_pv_status_state
     ON pv_status (state);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pv_status_pv_id
+    ON pv_status (pv_id)
+    WHERE pv_id IS NOT NULL;

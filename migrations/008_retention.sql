@@ -3,11 +3,14 @@
 -- ═══════════════════════════════════════════════════════════════════════
 --
 -- Strategy:
---   - Raw scalar data:  90 days  (after that, hourly/daily aggregates remain)
---   - Array/waveform:   60 days  (larger rows, aggregates less meaningful)
---   - Image data:       14 days  (very large, keep only recent)
---   - Everything else:  90 days
---   - Aggregates:       forever  (tiny rows, infinite retention)
+--   - ALL raw data:     90 days, lossless and queryable (project requirement:
+--                        same precision, same point count as ingested)
+--   - Aggregates:       hourly 2 years, daily forever (see 009)
+--
+-- Disk budget reminder: at a sustained S ev/s, 90 days of scalars ≈
+--   S × 7.78e6 rows, ~1.5-3 B/row after roll-up compression.
+--   300k ev/s → ~2.3e12 rows → ~4-7 TB; 1M ev/s sustained → ~12-23 TB.
+--   Images are the wildcard: budget them separately from `compressed_size`.
 --
 -- Retention drops entire chunks, which is instantaneous (no DELETE scan).
 -- TimescaleDB handles this in background workers.
@@ -33,6 +36,7 @@ SELECT add_retention_policy('samples_table', INTERVAL '90 days',
 SELECT add_retention_policy('samples_custom', INTERVAL '90 days',
                             if_not_exists => TRUE);
 
--- ─── Image data (14 days — largest per-row cost) ───────────────────
-SELECT add_retention_policy('samples_image', INTERVAL '14 days',
+-- ─── Image data (90 days, aligned with the lossless-window requirement;
+--      largest per-row cost, monitor disk usage) ───────────────────────
+SELECT add_retention_policy('samples_image', INTERVAL '90 days',
                             if_not_exists => TRUE);
