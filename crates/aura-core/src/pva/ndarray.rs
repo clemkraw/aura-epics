@@ -32,12 +32,18 @@ pub struct Codec {
 impl Codec {
     /// Create a codec descriptor.
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), parameters: serde_json::Value::Null }
+        Self {
+            name: name.into(),
+            parameters: serde_json::Value::Null,
+        }
     }
 
     /// Create a codec with parameters.
     pub fn with_params(name: impl Into<String>, parameters: serde_json::Value) -> Self {
-        Self { name: name.into(), parameters }
+        Self {
+            name: name.into(),
+            parameters,
+        }
     }
 
     /// Whether the data is uncompressed (no codec).
@@ -54,7 +60,10 @@ impl Codec {
 
 impl Default for Codec {
     fn default() -> Self {
-        Self { name: String::new(), parameters: serde_json::Value::Null }
+        Self {
+            name: String::new(),
+            parameters: serde_json::Value::Null,
+        }
     }
 }
 
@@ -99,17 +108,31 @@ pub struct Dimension {
     pub reverse: bool,
 }
 
-fn default_one() -> i32 { 1 }
+fn default_one() -> i32 {
+    1
+}
 
 impl Dimension {
     /// Create a simple dimension (no ROI, no binning).
     pub fn new(size: i32) -> Self {
-        Self { size, offset: 0, full_size: size, binning: 1, reverse: false }
+        Self {
+            size,
+            offset: 0,
+            full_size: size,
+            binning: 1,
+            reverse: false,
+        }
     }
 
     /// Create a dimension with ROI.
     pub fn with_roi(size: i32, offset: i32, full_size: i32) -> Self {
-        Self { size, offset, full_size, binning: 1, reverse: false }
+        Self {
+            size,
+            offset,
+            full_size,
+            binning: 1,
+            reverse: false,
+        }
     }
 
     /// Whether this dimension has a ROI (subset of the full detector).
@@ -133,7 +156,9 @@ impl fmt::Display for Dimension {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_roi() {
             write!(f, "{}@{}(/{}", self.size, self.offset, self.full_size)?;
-            if self.is_binned() { write!(f, " bin={}", self.binning)?; }
+            if self.is_binned() {
+                write!(f, " bin={}", self.binning)?;
+            }
             write!(f, ")")
         } else if self.is_binned() {
             write!(f, "{} bin={}", self.size, self.binning)
@@ -143,12 +168,12 @@ impl fmt::Display for Dimension {
     }
 }
 
-
 /// Source type for an NDArray attribute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(i32)]
 pub enum AttributeSourceType {
     /// Value comes from the detector driver.
+    #[default]
     Driver = 0,
     /// Value comes from an asyn parameter.
     Param = 1,
@@ -171,10 +196,6 @@ impl From<AttributeSourceType> for i32 {
     fn from(v: AttributeSourceType) -> Self {
         v as i32
     }
-}
-
-impl Default for AttributeSourceType {
-    fn default() -> Self { Self::Driver }
 }
 
 impl fmt::Display for AttributeSourceType {
@@ -329,19 +350,37 @@ mod tests {
 
     #[test]
     fn test_dimension_is_roi_offset_only() {
-        let d = Dimension { size: 1024, offset: 10, full_size: 1024, binning: 1, reverse: false };
+        let d = Dimension {
+            size: 1024,
+            offset: 10,
+            full_size: 1024,
+            binning: 1,
+            reverse: false,
+        };
         assert!(d.is_roi()); // offset != 0 → ROI
     }
 
     #[test]
     fn test_dimension_is_roi_size_mismatch() {
-        let d = Dimension { size: 512, offset: 0, full_size: 1024, binning: 1, reverse: false };
+        let d = Dimension {
+            size: 512,
+            offset: 0,
+            full_size: 1024,
+            binning: 1,
+            reverse: false,
+        };
         assert!(d.is_roi()); // size != full_size → ROI
     }
 
     #[test]
     fn test_dimension_binning() {
-        let d = Dimension { size: 512, offset: 0, full_size: 512, binning: 2, reverse: false };
+        let d = Dimension {
+            size: 512,
+            offset: 0,
+            full_size: 512,
+            binning: 2,
+            reverse: false,
+        };
         assert!(d.is_binned());
         assert_eq!(d.detector_extent(), 1024); // 512 × 2
     }
@@ -365,13 +404,25 @@ mod tests {
 
     #[test]
     fn test_dimension_display_binned() {
-        let d = Dimension { size: 512, offset: 0, full_size: 512, binning: 2, reverse: false };
+        let d = Dimension {
+            size: 512,
+            offset: 0,
+            full_size: 512,
+            binning: 2,
+            reverse: false,
+        };
         assert_eq!(d.to_string(), "512 bin=2");
     }
 
     #[test]
     fn test_dimension_display_roi_and_binned() {
-        let d = Dimension { size: 256, offset: 50, full_size: 1024, binning: 4, reverse: false };
+        let d = Dimension {
+            size: 256,
+            offset: 50,
+            full_size: 1024,
+            binning: 4,
+            reverse: false,
+        };
         assert_eq!(d.to_string(), "256@50(/1024 bin=4)");
     }
 
@@ -399,7 +450,13 @@ mod tests {
 
     #[test]
     fn test_dimension_serde_roundtrip() {
-        let d = Dimension { size: 512, offset: 100, full_size: 1024, binning: 2, reverse: true };
+        let d = Dimension {
+            size: 512,
+            offset: 100,
+            full_size: 1024,
+            binning: 2,
+            reverse: true,
+        };
         let json = serde_json::to_string(&d).unwrap();
         let back: Dimension = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
@@ -452,7 +509,11 @@ mod tests {
 
     #[test]
     fn test_source_type_serde() {
-        for st in [AttributeSourceType::Driver, AttributeSourceType::Param, AttributeSourceType::EpicsPv] {
+        for st in [
+            AttributeSourceType::Driver,
+            AttributeSourceType::Param,
+            AttributeSourceType::EpicsPv,
+        ] {
             let json = serde_json::to_string(&st).unwrap();
             let back: AttributeSourceType = serde_json::from_str(&json).unwrap();
             assert_eq!(st, back);
@@ -471,8 +532,10 @@ mod tests {
     #[test]
     fn test_attribute_with_source() {
         let a = NdAttribute::with_source(
-            "BeamX", ScalarValue::Double(512.3),
-            "cam1:BeamX", AttributeSourceType::EpicsPv,
+            "BeamX",
+            ScalarValue::Double(512.3),
+            "cam1:BeamX",
+            AttributeSourceType::EpicsPv,
         );
         assert_eq!(a.source, "cam1:BeamX");
         assert_eq!(a.source_type, AttributeSourceType::EpicsPv);
@@ -520,8 +583,10 @@ mod tests {
     #[test]
     fn test_attribute_serde_roundtrip() {
         let a = NdAttribute::with_source(
-            "Exposure", ScalarValue::Double(0.05),
-            "driver", AttributeSourceType::Param,
+            "Exposure",
+            ScalarValue::Double(0.05),
+            "driver",
+            AttributeSourceType::Param,
         );
         let json = serde_json::to_string(&a).unwrap();
         let back: NdAttribute = serde_json::from_str(&json).unwrap();

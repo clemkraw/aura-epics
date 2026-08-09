@@ -128,27 +128,42 @@ mod tests {
 
     #[test]
     fn test_msg_redis() {
-        assert_eq!(AuraError::redis("timeout").to_string(), "Redis error: timeout");
+        assert_eq!(
+            AuraError::redis("timeout").to_string(),
+            "Redis error: timeout"
+        );
     }
 
     #[test]
     fn test_msg_database() {
-        assert_eq!(AuraError::database("syntax").to_string(), "Database error: syntax");
+        assert_eq!(
+            AuraError::database("syntax").to_string(),
+            "Database error: syntax"
+        );
     }
 
     #[test]
     fn test_msg_pva() {
-        assert_eq!(AuraError::pva("bad magic").to_string(), "PVA protocol error: bad magic");
+        assert_eq!(
+            AuraError::pva("bad magic").to_string(),
+            "PVA protocol error: bad magic"
+        );
     }
 
     #[test]
     fn test_msg_config() {
-        assert_eq!(AuraError::config("missing key").to_string(), "Configuration error: missing key");
+        assert_eq!(
+            AuraError::config("missing key").to_string(),
+            "Configuration error: missing key"
+        );
     }
 
     #[test]
     fn test_msg_serialization() {
-        assert_eq!(AuraError::serialization("bad json").to_string(), "Serialization error: bad json");
+        assert_eq!(
+            AuraError::serialization("bad json").to_string(),
+            "Serialization error: bad json"
+        );
     }
 
     #[test]
@@ -170,7 +185,10 @@ mod tests {
 
     #[test]
     fn test_msg_internal() {
-        assert_eq!(AuraError::internal("bad state").to_string(), "Internal error: bad state");
+        assert_eq!(
+            AuraError::internal("bad state").to_string(),
+            "Internal error: bad state"
+        );
     }
 
     // ── Error source chain (#[from]) ─────────────────────────────────
@@ -205,8 +223,11 @@ mod tests {
             AuraError::internal("x"),
         ];
         for e in &variants {
-            assert!(StdError::source(e).is_none(),
-                    "expected no source for {}", e);
+            assert!(
+                StdError::source(e).is_none(),
+                "expected no source for {}",
+                e
+            );
         }
     }
 

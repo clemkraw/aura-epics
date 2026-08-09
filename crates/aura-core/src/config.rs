@@ -9,6 +9,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
+use std::str::FromStr;
+use crate::AuraError;
 
 /// Top-level configuration for the AURA system.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -32,11 +34,6 @@ impl AuraConfig {
         Self::from_str(&content)
     }
 
-    /// Parse configuration from a TOML string.
-    pub fn from_str(toml: &str) -> Result<Self, crate::AuraError> {
-        toml::from_str(toml).map_err(|e| crate::AuraError::config(format!("invalid TOML: {e}")))
-    }
-
     /// Validate configuration for logical consistency.
     pub fn validate(&self) -> Vec<ConfigIssue> {
         let mut issues = Vec::new();
@@ -53,6 +50,15 @@ impl AuraConfig {
         }
 
         issues
+    }
+}
+
+impl FromStr for AuraConfig {
+    type Err = AuraError;
+
+    /// Parse configuration from a TOML string.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        toml::from_str(s).map_err(|e| AuraError::config(format!("invalid TOML: {e}")))
     }
 }
 
@@ -172,12 +178,6 @@ pub struct TelemetryConfig {
 mod d {
     pub fn redis_url() -> String {
         "redis://127.0.0.1:6379".into()
-    }
-    pub fn stream_name() -> String {
-        "aura:samples".into()
-    }
-    pub fn consumer_group() -> String {
-        "aura-writers".into()
     }
     pub fn database_url() -> String {
         "postgresql://aura:aura@localhost/aura".into()

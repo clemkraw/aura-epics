@@ -26,9 +26,8 @@ pub use display::{Control, Display, DisplayForm, ValueAlarm};
 pub use enums::EnumValue;
 pub use ndarray::{Codec, Dimension, NdAttribute};
 pub use normative::{
-    CustomStructure, NTAggregate, NTContinuum, NTEnum, NTHistogram,
-    NTMatrix, NTMultiChannel, NTNDArray, NTNameValue, NTScalar,
-    NTScalarArray, NTTable, NTUnion, NormativeType,
+    CustomStructure, NTAggregate, NTContinuum, NTEnum, NTHistogram, NTMatrix, NTMultiChannel,
+    NTNDArray, NTNameValue, NTScalar, NTScalarArray, NTTable, NTUnion, NormativeType,
 };
 pub use scalars::{ScalarType, ScalarValue};
 pub use table::{HistogramValue, TableColumn};

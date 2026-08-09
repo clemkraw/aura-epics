@@ -25,7 +25,10 @@ pub struct TableColumn {
 
 impl TableColumn {
     pub fn new(name: impl Into<String>, values: ArrayValue) -> Self {
-        Self { name: name.into(), values }
+        Self {
+            name: name.into(),
+            values,
+        }
     }
 
     /// Number of rows in this column.
@@ -74,8 +77,8 @@ impl HistogramValue {
     pub fn len(&self) -> usize {
         match self {
             Self::Short(v) => v.len(),
-            Self::Int(v)   => v.len(),
-            Self::Long(v)  => v.len(),
+            Self::Int(v) => v.len(),
+            Self::Long(v) => v.len(),
         }
     }
 
@@ -88,8 +91,8 @@ impl HistogramValue {
     pub fn as_i64_vec(&self) -> Vec<i64> {
         match self {
             Self::Short(v) => v.iter().map(|&x| x as i64).collect(),
-            Self::Int(v)   => v.iter().map(|&x| x as i64).collect(),
-            Self::Long(v)  => v.clone(),
+            Self::Int(v) => v.iter().map(|&x| x as i64).collect(),
+            Self::Long(v) => v.clone(),
         }
     }
 
@@ -97,8 +100,8 @@ impl HistogramValue {
     pub fn as_f64_vec(&self) -> Vec<f64> {
         match self {
             Self::Short(v) => v.iter().map(|&x| x as f64).collect(),
-            Self::Int(v)   => v.iter().map(|&x| x as f64).collect(),
-            Self::Long(v)  => v.iter().map(|&x| x as f64).collect(),
+            Self::Int(v) => v.iter().map(|&x| x as f64).collect(),
+            Self::Long(v) => v.iter().map(|&x| x as f64).collect(),
         }
     }
 
@@ -106,8 +109,8 @@ impl HistogramValue {
     pub fn total(&self) -> i64 {
         match self {
             Self::Short(v) => v.iter().map(|&x| x as i64).sum(),
-            Self::Int(v)   => v.iter().map(|&x| x as i64).sum(),
-            Self::Long(v)  => v.iter().sum(),
+            Self::Int(v) => v.iter().map(|&x| x as i64).sum(),
+            Self::Long(v) => v.iter().sum(),
         }
     }
 
@@ -115,8 +118,8 @@ impl HistogramValue {
     pub fn max(&self) -> Option<i64> {
         match self {
             Self::Short(v) => v.iter().max().map(|&x| x as i64),
-            Self::Int(v)   => v.iter().max().map(|&x| x as i64),
-            Self::Long(v)  => v.iter().max().copied(),
+            Self::Int(v) => v.iter().max().map(|&x| x as i64),
+            Self::Long(v) => v.iter().max().copied(),
         }
     }
 
@@ -124,8 +127,8 @@ impl HistogramValue {
     pub fn element_type(&self) -> &'static str {
         match self {
             Self::Short(_) => "short",
-            Self::Int(_)   => "int",
-            Self::Long(_)  => "long",
+            Self::Int(_) => "int",
+            Self::Long(_) => "long",
         }
     }
 }

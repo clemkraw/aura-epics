@@ -11,7 +11,7 @@
 //! Call [`init`] once at the start of `main()`. For tests, use
 //! [`init_default`] which silently handles double-initialization.
 
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::config::TelemetryConfig;
 
@@ -75,8 +75,7 @@ pub fn init_default() {
 
 /// Build an `EnvFilter` from `RUST_LOG` or the config fallback.
 fn build_filter(config_level: &str) -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(config_level))
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(config_level))
 }
 
 #[cfg(test)]
@@ -87,15 +86,24 @@ mod tests {
     // ── Config construction ──────────────────────────────────────────
 
     fn json_config() -> TelemetryConfig {
-        TelemetryConfig { log_level: "debug".into(), log_format: "json".into() }
+        TelemetryConfig {
+            log_level: "debug".into(),
+            log_format: "json".into(),
+        }
     }
 
     fn pretty_config() -> TelemetryConfig {
-        TelemetryConfig { log_level: "warn".into(), log_format: "pretty".into() }
+        TelemetryConfig {
+            log_level: "warn".into(),
+            log_format: "pretty".into(),
+        }
     }
 
     fn unknown_format_config() -> TelemetryConfig {
-        TelemetryConfig { log_level: "info".into(), log_format: "yaml".into() }
+        TelemetryConfig {
+            log_level: "info".into(),
+            log_format: "yaml".into(),
+        }
     }
 
     // ── build_filter ─────────────────────────────────────────────────

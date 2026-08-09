@@ -40,17 +40,17 @@ impl ArrayValue {
     pub fn as_f64_vec(&self) -> Option<Vec<f64>> {
         match self {
             Self::BooleanArray(v) => Some(v.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect()),
-            Self::ByteArray(v)    => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::UByteArray(v)   => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::ShortArray(v)   => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::UShortArray(v)  => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::IntArray(v)     => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::UIntArray(v)    => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::LongArray(v)    => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::ULongArray(v)   => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::FloatArray(v)   => Some(v.iter().map(|&x| x as f64).collect()),
-            Self::DoubleArray(v)  => Some(v.clone()),
-            Self::StringArray(_)  => None,
+            Self::ByteArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::UByteArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::ShortArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::UShortArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::IntArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::UIntArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::LongArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::ULongArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::FloatArray(v) => Some(v.iter().map(|&x| x as f64).collect()),
+            Self::DoubleArray(v) => Some(v.clone()),
+            Self::StringArray(_) => None,
         }
     }
 
@@ -59,17 +59,17 @@ impl ArrayValue {
     pub fn len(&self) -> usize {
         match self {
             Self::BooleanArray(v) => v.len(),
-            Self::ByteArray(v)    => v.len(),
-            Self::UByteArray(v)   => v.len(),
-            Self::ShortArray(v)   => v.len(),
-            Self::UShortArray(v)  => v.len(),
-            Self::IntArray(v)     => v.len(),
-            Self::UIntArray(v)    => v.len(),
-            Self::LongArray(v)    => v.len(),
-            Self::ULongArray(v)   => v.len(),
-            Self::FloatArray(v)   => v.len(),
-            Self::DoubleArray(v)  => v.len(),
-            Self::StringArray(v)  => v.len(),
+            Self::ByteArray(v) => v.len(),
+            Self::UByteArray(v) => v.len(),
+            Self::ShortArray(v) => v.len(),
+            Self::UShortArray(v) => v.len(),
+            Self::IntArray(v) => v.len(),
+            Self::UIntArray(v) => v.len(),
+            Self::LongArray(v) => v.len(),
+            Self::ULongArray(v) => v.len(),
+            Self::FloatArray(v) => v.len(),
+            Self::DoubleArray(v) => v.len(),
+            Self::StringArray(v) => v.len(),
         }
     }
 
@@ -84,24 +84,24 @@ impl ArrayValue {
     pub fn element_type(&self) -> ScalarType {
         match self {
             Self::BooleanArray(_) => ScalarType::Boolean,
-            Self::ByteArray(_)    => ScalarType::Byte,
-            Self::UByteArray(_)   => ScalarType::UByte,
-            Self::ShortArray(_)   => ScalarType::Short,
-            Self::UShortArray(_)  => ScalarType::UShort,
-            Self::IntArray(_)     => ScalarType::Int,
-            Self::UIntArray(_)    => ScalarType::UInt,
-            Self::LongArray(_)    => ScalarType::Long,
-            Self::ULongArray(_)   => ScalarType::ULong,
-            Self::FloatArray(_)   => ScalarType::Float,
-            Self::DoubleArray(_)  => ScalarType::Double,
-            Self::StringArray(_)  => ScalarType::String,
+            Self::ByteArray(_) => ScalarType::Byte,
+            Self::UByteArray(_) => ScalarType::UByte,
+            Self::ShortArray(_) => ScalarType::Short,
+            Self::UShortArray(_) => ScalarType::UShort,
+            Self::IntArray(_) => ScalarType::Int,
+            Self::UIntArray(_) => ScalarType::UInt,
+            Self::LongArray(_) => ScalarType::Long,
+            Self::ULongArray(_) => ScalarType::ULong,
+            Self::FloatArray(_) => ScalarType::Float,
+            Self::DoubleArray(_) => ScalarType::Double,
+            Self::StringArray(_) => ScalarType::String,
         }
     }
 
     /// Whether the array elements are numeric (not String).
     #[inline]
     pub fn is_numeric(&self) -> bool {
-        self.element_type().is_numeric()
+        !matches!(self, Self::StringArray(_))
     }
 
     /// Total size in bytes on the wire (element_size × len).
@@ -119,9 +119,7 @@ impl ArrayValue {
         if a.len() != b.len() {
             return None;
         }
-        let sum_sq: f64 = a.iter().zip(b.iter())
-            .map(|(x, y)| (x - y).powi(2))
-            .sum();
+        let sum_sq: f64 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
         Some(sum_sq.sqrt())
     }
 }
@@ -142,18 +140,78 @@ mod tests {
     fn all_variants() -> Vec<(ArrayValue, ScalarType, usize, bool)> {
         // (value, element_type, len, is_numeric)
         vec![
-            (ArrayValue::BooleanArray(vec![true, false]),     ScalarType::Boolean, 2, true),
-            (ArrayValue::ByteArray(vec![-1, 0, 1]),           ScalarType::Byte,    3, true),
-            (ArrayValue::UByteArray(vec![0, 128, 255]),        ScalarType::UByte,   3, true),
-            (ArrayValue::ShortArray(vec![-100, 0, 100]),       ScalarType::Short,   3, true),
-            (ArrayValue::UShortArray(vec![0, 1000, 65535]),     ScalarType::UShort,  3, true),
-            (ArrayValue::IntArray(vec![-1, 0, 1]),             ScalarType::Int,     3, true),
-            (ArrayValue::UIntArray(vec![0, 42, u32::MAX]),      ScalarType::UInt,    3, true),
-            (ArrayValue::LongArray(vec![i64::MIN, 0, i64::MAX]), ScalarType::Long,  3, true),
-            (ArrayValue::ULongArray(vec![0, 1, u64::MAX]),     ScalarType::ULong,   3, true),
-            (ArrayValue::FloatArray(vec![1.0, 2.5, -3.0]),     ScalarType::Float,   3, true),
-            (ArrayValue::DoubleArray(vec![1.0, 2.0, 3.0]),     ScalarType::Double,  3, true),
-            (ArrayValue::StringArray(vec!["a".into(), "b".into()]), ScalarType::String, 2, false),
+            (
+                ArrayValue::BooleanArray(vec![true, false]),
+                ScalarType::Boolean,
+                2,
+                true,
+            ),
+            (
+                ArrayValue::ByteArray(vec![-1, 0, 1]),
+                ScalarType::Byte,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::UByteArray(vec![0, 128, 255]),
+                ScalarType::UByte,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::ShortArray(vec![-100, 0, 100]),
+                ScalarType::Short,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::UShortArray(vec![0, 1000, 65535]),
+                ScalarType::UShort,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::IntArray(vec![-1, 0, 1]),
+                ScalarType::Int,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::UIntArray(vec![0, 42, u32::MAX]),
+                ScalarType::UInt,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::LongArray(vec![i64::MIN, 0, i64::MAX]),
+                ScalarType::Long,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::ULongArray(vec![0, 1, u64::MAX]),
+                ScalarType::ULong,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::FloatArray(vec![1.0, 2.5, -3.0]),
+                ScalarType::Float,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::DoubleArray(vec![1.0, 2.0, 3.0]),
+                ScalarType::Double,
+                3,
+                true,
+            ),
+            (
+                ArrayValue::StringArray(vec!["a".into(), "b".into()]),
+                ScalarType::String,
+                2,
+                false,
+            ),
         ]
     }
 
@@ -162,8 +220,12 @@ mod tests {
     #[test]
     fn test_element_type_all_variants() {
         for (arr, expected_type, _, _) in all_variants() {
-            assert_eq!(arr.element_type(), expected_type,
-                       "element_type mismatch for {:?}", arr.element_type());
+            assert_eq!(
+                arr.element_type(),
+                expected_type,
+                "element_type mismatch for {:?}",
+                arr.element_type()
+            );
         }
     }
 
@@ -172,8 +234,7 @@ mod tests {
     #[test]
     fn test_len_all_variants() {
         for (arr, _, expected_len, _) in all_variants() {
-            assert_eq!(arr.len(), expected_len,
-                       "len mismatch for {}", arr);
+            assert_eq!(arr.len(), expected_len, "len mismatch for {}", arr);
         }
     }
 
@@ -211,8 +272,12 @@ mod tests {
     #[test]
     fn test_is_numeric_all_variants() {
         for (arr, _, _, expected_numeric) in all_variants() {
-            assert_eq!(arr.is_numeric(), expected_numeric,
-                       "is_numeric mismatch for {}", arr);
+            assert_eq!(
+                arr.is_numeric(),
+                expected_numeric,
+                "is_numeric mismatch for {}",
+                arr
+            );
         }
     }
 
@@ -223,7 +288,11 @@ mod tests {
         // All numeric variants must return Some
         for (arr, _, _, is_numeric) in all_variants() {
             if is_numeric {
-                assert!(arr.as_f64_vec().is_some(), "as_f64_vec should be Some for {}", arr);
+                assert!(
+                    arr.as_f64_vec().is_some(),
+                    "as_f64_vec should be Some for {}",
+                    arr
+                );
                 assert_eq!(arr.as_f64_vec().unwrap().len(), arr.len());
             }
         }
@@ -287,8 +356,8 @@ mod tests {
     fn test_wire_size() {
         assert_eq!(ArrayValue::DoubleArray(vec![1.0, 2.0]).wire_size(), 16); // 2 × 8
         assert_eq!(ArrayValue::UByteArray(vec![0; 1024]).wire_size(), 1024); // 1024 × 1
-        assert_eq!(ArrayValue::IntArray(vec![0; 10]).wire_size(), 40);       // 10 × 4
-        assert_eq!(ArrayValue::ShortArray(vec![0; 5]).wire_size(), 10);      // 5 × 2
+        assert_eq!(ArrayValue::IntArray(vec![0; 10]).wire_size(), 40); // 10 × 4
+        assert_eq!(ArrayValue::ShortArray(vec![0; 5]).wire_size(), 10); // 5 × 2
         assert_eq!(ArrayValue::StringArray(vec!["a".into()]).wire_size(), 0); // variable
     }
 
@@ -351,7 +420,12 @@ mod tests {
         for (arr, expected_type, expected_len, _) in all_variants() {
             let display = arr.to_string();
             let expected = format!("{}[{}]", expected_type, expected_len);
-            assert_eq!(display, expected, "Display mismatch for {:?}", arr.element_type());
+            assert_eq!(
+                display,
+                expected,
+                "Display mismatch for {:?}",
+                arr.element_type()
+            );
         }
     }
 
