@@ -40,11 +40,13 @@
 //! - The flush timer expires (100ms)
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sqlx::postgres::PgPool;
 
 use aura_core::PvUpdate;
-use aura_core::error::{AuraResult};
+use aura_core::error::AuraResult;
 use aura_core::pva::{NormativeType, PvDataType};
 use aura_core::sample::StoreReason;
 
@@ -496,157 +498,315 @@ pub struct FlushBundle {
     pub pool: copy_pool::CopyPool,
 }
 
+/// Result of [`FlushBundle::flush`]: what was written, what is retryable,
+/// and what is definitively lost.
+pub struct FlushOutcome {
+    /// Rows successfully committed, per table family.
+    pub report: FlushReport,
+    /// Transiently-failed rows, ready to be flushed again. `None` = nothing to retry.
+    pub retry: Option<Box<FlushBundle>>,
+    /// Rows permanently lost in this flush (COPY rows for destructured tables).
+    pub lost_rows: usize,
+    /// Human-readable error messages (one per failed COPY).
+    pub errors: Vec<String>,
+}
+
+impl FlushOutcome {
+    pub fn is_clean(&self) -> bool {
+        self.retry.is_none() && self.lost_rows == 0 && self.errors.is_empty()
+    }
+}
+
+/// Flush one section (one target table) of a bundle.
+///
+/// Splits into parallel chunks above `parallel_threshold` (pass
+/// `usize::MAX` to force the single-connection path). Returns
+/// `(rows_written, rows_to_retry)` and pushes failures into
+/// `errors` / `lost_rows`.
+async fn flush_section<T: Send>(
+    pool: &copy_pool::CopyPool,
+    sql: &'static str,
+    rows: Vec<T>,
+    build: fn(&[T]) -> Vec<u8>,
+    parallel_threshold: usize,
+    errors: &mut Vec<String>,
+    lost_rows: &mut usize,
+    progress: &Arc<AtomicU64>,
+) -> (usize, Vec<T>) {
+    let count = rows.len();
+    if count == 0 {
+        return (0, Vec::new());
+    }
+    let n = pool.len();
+
+    if count >= parallel_threshold && n > 1 {
+        let chunk_size = (count + n - 1) / n; // ≥ 1
+        let payloads: Vec<(Vec<u8>, usize)> = rows
+            .chunks(chunk_size)
+            .map(|chunk| (build(chunk), chunk.len()))
+            .collect();
+        // Per-chunk send with per-chunk progress (equivalent to
+        // CopyPool::send_parallel_classified, plus the progress increment
+        // in the same poll as each chunk's commit).
+        let futs: Vec<_> = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(i, (payload, row_count))| {
+                let pool = pool.clone();
+                let progress = Arc::clone(progress);
+                async move {
+                    let r = pool
+                        .send_copy_classified(i, sql, bytes::Bytes::from(payload), row_count)
+                        .await;
+                    if r.is_ok() {
+                        progress.fetch_add(row_count as u64, Ordering::Relaxed);
+                    }
+                    r.map(|()| row_count)
+                }
+            })
+            .collect();
+        let results = futures_util::future::join_all(futs).await;
+
+        let mut written = 0usize;
+        let mut retry_chunk = vec![false; results.len()];
+        for (i, r) in results.iter().enumerate() {
+            match r {
+                Ok(n_rows) => written += n_rows,
+                Err(e) => {
+                    errors.push(e.to_string());
+                    if e.transient {
+                        retry_chunk[i] = true;
+                    } else {
+                        let start = i * chunk_size;
+                        let end = (start + chunk_size).min(count);
+                        *lost_rows += end - start;
+                    }
+                }
+            }
+        }
+
+        if retry_chunk.iter().any(|&b| b) {
+            // Move only the rows of transiently-failed chunks out of `rows`.
+            let keep: Vec<T> = rows
+                .into_iter()
+                .enumerate()
+                .filter_map(|(pos, row)| retry_chunk[pos / chunk_size].then_some(row))
+                .collect();
+            (written, keep)
+        } else {
+            (written, Vec::new())
+        }
+    } else {
+        let payload = build(&rows);
+        match pool
+            .send_copy_classified(0, sql, bytes::Bytes::from(payload), count)
+            .await
+        {
+            Ok(()) => {
+                progress.fetch_add(count as u64, Ordering::Relaxed);
+                (count, Vec::new())
+            }
+            Err(e) => {
+                errors.push(e.to_string());
+                if e.transient {
+                    (0, rows)
+                } else {
+                    *lost_rows += count;
+                    (0, Vec::new())
+                }
+            }
+        }
+    }
+}
+
 impl FlushBundle {
     /// Flush all buffers to PostgreSQL via COPY.
-    pub async fn flush(self) -> Result<FlushReport, String> {
-        let pool = &self.pool;
+    pub async fn flush(self) -> FlushOutcome {
+        self.flush_with_progress(Arc::new(AtomicU64::new(0))).await
+    }
+
+    /// Like [`FlushBundle::flush`], but increments `progress` by the row
+    /// count of each COPY chunk as it commits.
+    pub async fn flush_with_progress(self, progress: Arc<AtomicU64>) -> FlushOutcome {
         const PARALLEL_THRESHOLD: usize = 10_000;
 
-        let scalar = if !self.scalar_rows.is_empty() {
-            let count = self.scalar_rows.len();
-            let n = pool.len();
-            if count >= PARALLEL_THRESHOLD && n > 1 {
-                let chunk_size = (count + n - 1) / n;
-                let payloads: Vec<_> = self
-                    .scalar_rows
-                    .chunks(chunk_size)
-                    .map(|chunk| (ScalarWriter::build_copy_payload(chunk), chunk.len()))
-                    .collect();
-                pool.send_parallel(ScalarWriter::COPY_SQL, payloads)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            } else {
-                let payload = ScalarWriter::build_copy_payload(&self.scalar_rows);
-                pool.send_copy(0, ScalarWriter::COPY_SQL, payload, count)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            count
-        } else {
-            0
-        };
+        let FlushBundle {
+            scalar_rows,
+            string_rows,
+            array_num_rows,
+            array_str_rows,
+            json_rows,
+            image_rows,
+            pool,
+        } = self;
 
-        let string = if !self.string_rows.is_empty() {
-            let count = self.string_rows.len();
-            let n = pool.len();
-            if count >= PARALLEL_THRESHOLD && n > 1 {
-                let chunk_size = (count + n - 1) / n;
-                let payloads: Vec<_> = self
-                    .string_rows
-                    .chunks(chunk_size)
-                    .map(|chunk| (StringWriter::build_copy_payload(chunk), chunk.len()))
-                    .collect();
-                pool.send_parallel(string::COPY_SQL, payloads)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            } else {
-                let payload = StringWriter::build_copy_payload(&self.string_rows);
-                pool.send_copy(0, string::COPY_SQL, payload, count)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            count
-        } else {
-            0
-        };
+        let mut errors: Vec<String> = Vec::new();
+        let mut lost_rows = 0usize;
 
-        let array = if !self.array_num_rows.is_empty() || !self.array_str_rows.is_empty() {
-            let mut total = 0;
-            if !self.array_num_rows.is_empty() {
-                let count = self.array_num_rows.len();
-                let n = pool.len();
-                if count >= PARALLEL_THRESHOLD && n > 1 {
-                    let chunk_size = (count + n - 1) / n;
-                    let payloads: Vec<_> = self
-                        .array_num_rows
-                        .chunks(chunk_size)
-                        .map(|chunk| (ArrayWriter::build_num_payload(chunk), chunk.len()))
-                        .collect();
-                    pool.send_parallel(array::COPY_SQL_NUM, payloads)
+        let (scalar, keep_scalar) = flush_section(
+            &pool,
+            ScalarWriter::COPY_SQL,
+            scalar_rows,
+            ScalarWriter::build_copy_payload,
+            PARALLEL_THRESHOLD,
+            &mut errors,
+            &mut lost_rows,
+            &progress,
+        )
+        .await;
+
+        let (string, keep_string) = flush_section(
+            &pool,
+            string::COPY_SQL,
+            string_rows,
+            StringWriter::build_copy_payload,
+            PARALLEL_THRESHOLD,
+            &mut errors,
+            &mut lost_rows,
+            &progress,
+        )
+        .await;
+
+        let (array_num, keep_array_num) = flush_section(
+            &pool,
+            array::COPY_SQL_NUM,
+            array_num_rows,
+            ArrayWriter::build_num_payload,
+            PARALLEL_THRESHOLD,
+            &mut errors,
+            &mut lost_rows,
+            &progress,
+        )
+        .await;
+
+        let (array_str, keep_array_str) = flush_section(
+            &pool,
+            array::COPY_SQL_STR,
+            array_str_rows,
+            ArrayWriter::build_str_payload,
+            usize::MAX, // always single-connection (rare rows)
+            &mut errors,
+            &mut lost_rows,
+            &progress,
+        )
+        .await;
+
+        // ── JSON family: one shared row Vec, six target tables. ──
+        // On failure, retain only the rows of the tables whose COPY failed
+        // transiently (rows of committed tables must NOT be resent).
+        let mut json = 0usize;
+        let mut keep_json: Vec<JsonRow> = Vec::new();
+        if !json_rows.is_empty() {
+            use json::JsonTable;
+            type JsonBuilder = fn(&[JsonRow]) -> Option<(Vec<u8>, usize)>;
+            let plan: [(JsonTable, &'static str, JsonBuilder); 6] = [
+                (
+                    JsonTable::Table,
+                    json::COPY_TABLE,
+                    JsonWriter::build_table_payload,
+                ),
+                (
+                    JsonTable::Custom,
+                    json::COPY_CUSTOM,
+                    JsonWriter::build_custom_payload,
+                ),
+                (
+                    JsonTable::NameValue,
+                    json::COPY_NV,
+                    JsonWriter::build_nv_payload,
+                ),
+                (
+                    JsonTable::Histogram,
+                    json::COPY_HIST,
+                    JsonWriter::build_hist_payload,
+                ),
+                (
+                    JsonTable::Continuum,
+                    json::COPY_CONT,
+                    JsonWriter::build_cont_payload,
+                ),
+                (
+                    JsonTable::Multi,
+                    json::COPY_MCH,
+                    JsonWriter::build_mch_payload,
+                ),
+            ];
+
+            let mut retry_tables: Vec<JsonTable> = Vec::new();
+            for (table, sql, build) in plan {
+                if let Some((payload, n)) = build(&json_rows) {
+                    match pool
+                        .send_copy_classified(0, sql, bytes::Bytes::from(payload), n)
                         .await
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    let payload = ArrayWriter::build_num_payload(&self.array_num_rows);
-                    pool.send_copy(0, array::COPY_SQL_NUM, payload, count)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    {
+                        Ok(()) => {
+                            json += n;
+                            progress.fetch_add(n as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            errors.push(e.to_string());
+                            if e.transient {
+                                retry_tables.push(table);
+                            } else {
+                                lost_rows += n;
+                            }
+                        }
+                    }
                 }
-                total += count;
             }
-            if !self.array_str_rows.is_empty() {
-                let count = self.array_str_rows.len();
-                let payload = ArrayWriter::build_str_payload(&self.array_str_rows);
-                pool.send_copy(0, array::COPY_SQL_STR, payload, count)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                total += count;
+            if !retry_tables.is_empty() {
+                keep_json = json_rows
+                    .into_iter()
+                    .filter(|r| retry_tables.contains(&r.table))
+                    .collect();
             }
-            total
-        } else {
-            0
-        };
+        }
 
-        let json = if !self.json_rows.is_empty() {
-            let mut total = 0;
-            if let Some((payload, n)) = JsonWriter::build_table_payload(&self.json_rows) {
-                pool.send_copy(0, json::COPY_TABLE, payload, n)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                total += n;
-            }
-            if let Some((payload, n)) = JsonWriter::build_custom_payload(&self.json_rows) {
-                pool.send_copy(0, json::COPY_CUSTOM, payload, n)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                total += n;
-            }
-            if let Some((payload, n)) = JsonWriter::build_nv_payload(&self.json_rows) {
-                pool.send_copy(0, json::COPY_NV, payload, n)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                total += n;
-            }
-            if let Some((payload, n)) = JsonWriter::build_hist_payload(&self.json_rows) {
-                pool.send_copy(0, json::COPY_HIST, payload, n)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                total += n;
-            }
-            if let Some((payload, n)) = JsonWriter::build_cont_payload(&self.json_rows) {
-                pool.send_copy(0, json::COPY_CONT, payload, n)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                total += n;
-            }
-            if let Some((payload, n)) = JsonWriter::build_mch_payload(&self.json_rows) {
-                pool.send_copy(0, json::COPY_MCH, payload, n)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                total += n;
-            }
-            total
-        } else {
-            0
-        };
+        let (image, keep_image) = flush_section(
+            &pool,
+            image::COPY_SQL,
+            image_rows,
+            ImageWriter::build_copy_payload,
+            usize::MAX, // always single-connection (huge rows)
+            &mut errors,
+            &mut lost_rows,
+            &progress,
+        )
+        .await;
 
-        let image = if !self.image_rows.is_empty() {
-            let count = self.image_rows.len();
-            let payload = ImageWriter::build_copy_payload(&self.image_rows);
-            pool.send_copy(0, image::COPY_SQL, payload, count)
-                .await
-                .map_err(|e| e.to_string())?;
-            count
-        } else {
-            0
-        };
-
-        Ok(FlushReport {
+        let report = FlushReport {
             scalar,
             string,
-            array,
+            array: array_num + array_str,
             json,
             image,
-        })
+        };
+
+        let has_retry = !keep_scalar.is_empty()
+            || !keep_string.is_empty()
+            || !keep_array_num.is_empty()
+            || !keep_array_str.is_empty()
+            || !keep_json.is_empty()
+            || !keep_image.is_empty();
+
+        let retry = has_retry.then(|| {
+            Box::new(FlushBundle {
+                scalar_rows: keep_scalar,
+                string_rows: keep_string,
+                array_num_rows: keep_array_num,
+                array_str_rows: keep_array_str,
+                json_rows: keep_json,
+                image_rows: keep_image,
+                pool: pool.clone(),
+            })
+        });
+
+        FlushOutcome {
+            report,
+            retry,
+            lost_rows,
+            errors,
+        }
     }
 
     pub fn total_rows(&self) -> usize {
