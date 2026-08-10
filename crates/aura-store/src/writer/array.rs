@@ -559,10 +559,14 @@ mod tests {
         assert_eq!(w.len(), 0);
     }
 
-    #[test] fn backpressure() {
+    #[test]
+    fn backpressure() {
         let mut w = ArrayWriter::with_limits(100_000, 1024);
         w.push(num_capture(1, vec![1.0; 10])); // 10 * 66 = 660 bytes
-        assert_eq!(w.push(num_capture(2, vec![3.0; 10])), PushResult::BackpressureExceeded); // 660+660 > 1024
+        assert_eq!(
+            w.push(num_capture(2, vec![3.0; 10])),
+            PushResult::BackpressureExceeded
+        ); // 660+660 > 1024
     }
 
     #[test]

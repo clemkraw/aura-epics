@@ -20,6 +20,9 @@ pub struct IngestMetrics {
     pub fast_path: AtomicU64,
     /// Value events that went through the converter (first event per PV, rare types).
     pub slow_path: AtomicU64,
+    /// Events DROPPED because their PV was not in the pv_id cache (data loss,
+    /// distinct from `events_skipped` which counts intentional dedup skips).
+    pub events_dropped_unknown_pv: AtomicU64,
 
     // Counters (monotonic, incremented by main loop lifecycle handler):
     pub disconnects: AtomicU64,
@@ -34,6 +37,7 @@ impl IngestMetrics {
             events_skipped: AtomicU64::new(0),
             fast_path: AtomicU64::new(0),
             slow_path: AtomicU64::new(0),
+            events_dropped_unknown_pv: AtomicU64::new(0),
             disconnects: AtomicU64::new(0),
             reconnects: AtomicU64::new(0),
         }
@@ -50,6 +54,7 @@ impl IngestMetrics {
             fast_path: fp,
             slow_path: sp,
             fast_path_pct: if fp + sp > 0 { fp * 100 / (fp + sp) } else { 0 },
+            events_dropped_unknown_pv: self.events_dropped_unknown_pv.load(Relaxed),
             disconnects: self.disconnects.load(Relaxed),
             reconnects: self.reconnects.load(Relaxed),
         }
@@ -74,6 +79,9 @@ impl IngestMetrics {
              # HELP aura_slow_path Slow path events (converter decode)\n\
              # TYPE aura_slow_path counter\n\
              aura_slow_path {}\n\
+             # HELP aura_events_dropped_unknown_pv Events LOST: PV missing from pv_id cache\n\
+             # TYPE aura_events_dropped_unknown_pv counter\n\
+             aura_events_dropped_unknown_pv {}\n\
              # HELP aura_disconnects Total IOC disconnects\n\
              # TYPE aura_disconnects counter\n\
              aura_disconnects {}\n\
@@ -94,6 +102,7 @@ impl IngestMetrics {
             s.events_skipped,
             s.fast_path,
             s.slow_path,
+            s.events_dropped_unknown_pv,
             s.disconnects,
             s.reconnects,
             sessions,
@@ -119,6 +128,7 @@ pub struct MetricsSnapshot {
     pub slow_path: u64,
     /// Pre-computed fast_path percentage for display.
     pub fast_path_pct: u64,
+    pub events_dropped_unknown_pv: u64,
     pub disconnects: u64,
     pub reconnects: u64,
 }
@@ -127,10 +137,11 @@ impl std::fmt::Display for MetricsSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "events={} pub={} skip={} fast={}% dc={} rc={}",
+            "events={} pub={} skip={} drop_pv={} fast={}% dc={} rc={}",
             self.events_received,
             self.events_published,
             self.events_skipped,
+            self.events_dropped_unknown_pv,
             self.fast_path_pct,
             self.disconnects,
             self.reconnects

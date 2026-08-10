@@ -9,14 +9,14 @@
 //! - `channel`: CMD_CREATE_CHANNEL / DESTROY_CHANNEL
 //! - `monitor`: CMD_MONITOR (subscribe to value changes — hot path)
 
-pub mod status;
-pub mod search;
-pub mod connection;
 pub mod channel;
+pub mod connection;
 pub mod monitor;
+pub mod search;
+pub mod status;
 
-pub use status::{PvaStatus, StatusType};
-pub use search::{SearchRequest, SearchResponse};
-pub use connection::{ConnectionValidation, ConnectionValidated};
 pub use channel::{CreateChannelRequest, CreateChannelResponse, DestroyChannel};
+pub use connection::{ConnectionValidated, ConnectionValidation};
 pub use monitor::{MonitorRequest, MonitorResponseHeader, MonitorSubCommand};
+pub use search::{SearchRequest, SearchResponse};
+pub use status::{PvaStatus, StatusType};

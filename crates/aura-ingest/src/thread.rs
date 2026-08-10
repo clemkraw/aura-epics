@@ -36,14 +36,12 @@ pub fn run_ingest_shard(
     let mut last_heartbeat_scan = std::time::Instant::now();
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return;
-        }
 
         let mut local_events = 0u64;
         let mut local_published = 0u64;
         let mut local_fast = 0u64;
         let mut local_slow = 0u64;
+        let mut local_unknown_pv = 0u64;
 
         event_buf.clear();
         shard_rx.drain_into(&mut event_buf, 65536);
@@ -66,6 +64,7 @@ pub fn run_ingest_shard(
                 } else if let Some(&id) = cache.get(&*tagged.pv_name) {
                     id
                 } else {
+                    local_unknown_pv += 1;
                     continue;
                 };
                 shared_buf.push_scalar(aura_store::writer::scalar::ScalarRow::from_epoch(
@@ -108,6 +107,7 @@ pub fn run_ingest_shard(
                 } else if let Some(&id) = cache.get(&*tagged.pv_name) {
                     id
                 } else {
+                    local_unknown_pv += 1;
                     continue;
                 };
                 shared_buf.push_other(aura_store::writer::shared_buf::WriterRow::String(
@@ -147,6 +147,7 @@ pub fn run_ingest_shard(
                     } else if let Some(&id) = cache.get(&*tag_pv) {
                         id
                     } else {
+                        local_unknown_pv += 1;
                         continue;
                     };
                     let time =
@@ -176,6 +177,7 @@ pub fn run_ingest_shard(
                         } else if let Some(&id) = cache.get(&*update.pv_name) {
                             id
                         } else {
+                            local_unknown_pv += 1;
                             continue;
                         };
 
@@ -324,6 +326,11 @@ pub fn run_ingest_shard(
         metrics
             .events_skipped
             .fetch_add(engine.total_skipped, Ordering::Relaxed);
+        if local_unknown_pv > 0 {
+            metrics
+                .events_dropped_unknown_pv
+                .fetch_add(local_unknown_pv, Ordering::Relaxed);
+        }
         engine.total_events = 0;
         engine.total_published = 0;
         engine.total_skipped = 0;
@@ -352,10 +359,12 @@ pub fn run_ingest_shard(
             last_stats_flush = std::time::Instant::now();
         }
 
-        // Heartbeat scan.
-        if !heartbeat.is_disabled()
-            && last_heartbeat_scan.elapsed()
-                >= std::time::Duration::from_secs(crate::heartbeat::SCAN_INTERVAL_SECS)
+        // Heartbeat scan. No `is_disabled()` gate here: emit_heartbeats
+        // reloads the per-PV config first (which is what can enable the
+        // tracker when the global default is 0), then early-returns cheaply
+        // if nothing can fire.
+        if last_heartbeat_scan.elapsed()
+            >= std::time::Duration::from_secs(crate::heartbeat::SCAN_INTERVAL_SECS)
         {
             let active_ids: std::collections::HashSet<i32> =
                 pv_cache.load().values().copied().collect();

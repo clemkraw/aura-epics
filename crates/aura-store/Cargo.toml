@@ -10,7 +10,7 @@ aura-core = { path = "../aura-core" }
 sqlx = { workspace = true }
 tokio-postgres = { workspace = true }
 tokio = { workspace = true }
-redis = { workspace = true }
+arc-swap = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }

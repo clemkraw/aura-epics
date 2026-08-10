@@ -1,12 +1,14 @@
 //! Per-PV heartbeat tracking - forces periodic stores for stable PVs.
 //!
-//! When a PV's value doesn't change, the IOC sends no monitor update (MDEL deadband).
-//! Without heartbeat, the archiver has no data for that PV during stable periods - indistinguishable from a crash.
+//! ## Tri-state semantics (`pv_config.heartbeat_s`)
+//! - `NULL` (`-1.0`) -> Use global default from `aura.toml`
+//! - `0.0`          -> Heartbeat explicitly disabled
+//! - `> 0.0`        -> Per-PV interval override
 //!
-//! Each PV can have its own `heartbeat_s`:
-//! - `pv_config.heartbeat_s = 60.0` -> per-PV override
-//! - `pv_config.heartbeat_s = NULL` -> uses global default from aura.toml
-//! - `pv_config.heartbeat_s = 0.0` -> disabled for this PV
+//! ## Invariants
+//! 1. Heartbeats are only emitted for PVs with at least one real value (`last_severity >= 0`).
+//! 2. Unsubscribing invalidates cached values (`last_severity = -1`); heartbeats resume
+//!    only after a fresh event.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,23 +18,17 @@ use aura_core::sample::StoreReason;
 use aura_store::writer::scalar::ScalarRow;
 use aura_store::writer::shared_buf::SharedBuffer;
 
-/// Scan interval - how often `emit_heartbeats` should be called.
 pub const SCAN_INTERVAL_SECS: u64 = 10;
-
-/// Safety cap on pv_id to prevent unbounded Vec growth.
 const MAX_PV_ID: usize = 2_000_000;
 
-/// Per-PV heartbeat state.
-///
-/// 32 bytes per entry. 250k PVs per shard = 8 MB.
 #[derive(Clone)]
 struct HeartbeatEntry {
     last_value: f64,
+    /// Severity or `-1` (no value seen / invalidated after unsubscribe).
     last_severity: i16,
     last_status: i16,
-    /// Per-PV heartbeat interval. 0.0 = disabled for this PV.
+    /// Interval: `-1.0` = global default, `0.0` = disabled, `> 0.0` = override.
     heartbeat_s: f32,
-    /// Last time this PV stored a sample (wire event or heartbeat).
     last_store_at: Instant,
 }
 
@@ -40,45 +36,38 @@ impl HeartbeatEntry {
     fn new_inactive() -> Self {
         Self {
             last_value: 0.0,
-            last_severity: 0,
+            last_severity: -1,
             last_status: 0,
-            heartbeat_s: 0.0,
+            heartbeat_s: -1.0,
             last_store_at: Instant::now(),
         }
     }
 }
 
-/// Per-PV heartbeat tracker with configurable intervals.
 pub struct HeartbeatTracker {
     entries: Vec<HeartbeatEntry>,
-    /// Global default from aura.toml. Used when per-PV is not set.
     default_heartbeat_s: f32,
-    /// Shared per-PV heartbeat config, updated by main thread from pv_config.
+    has_explicit_override: bool,
     config_source: Arc<ArcSwap<Vec<(i32, f32)>>>,
-    /// Pointer to last-seen config - cheap change detection via Arc::as_ptr.
     config_ptr: usize,
 }
 
 impl HeartbeatTracker {
-    /// Create a tracker. `default_heartbeat_s = 0.0` disables globally.
     pub fn new(default_heartbeat_s: f64, config_source: Arc<ArcSwap<Vec<(i32, f32)>>>) -> Self {
         Self {
             entries: Vec::new(),
             default_heartbeat_s: default_heartbeat_s as f32,
+            has_explicit_override: false,
             config_source,
             config_ptr: 0,
         }
     }
 
-    /// Whether heartbeat is globally disabled (default = 0.0).
     #[inline]
     pub fn is_disabled(&self) -> bool {
-        self.default_heartbeat_s <= 0.0
+        self.default_heartbeat_s <= 0.0 && !self.has_explicit_override
     }
 
-    /// Override heartbeat interval for a specific PV.
-    ///
-    /// `heartbeat_s = 0.0` disables heartbeat for this PV.
     pub fn set_pv_heartbeat(&mut self, pv_id: i32, heartbeat_s: f64) {
         let idx = pv_id as usize;
         if idx > MAX_PV_ID {
@@ -88,9 +77,11 @@ impl HeartbeatTracker {
             self.entries.resize(idx + 1, HeartbeatEntry::new_inactive());
         }
         self.entries[idx].heartbeat_s = heartbeat_s as f32;
+        if heartbeat_s > 0.0 {
+            self.has_explicit_override = true;
+        }
     }
 
-    /// Record a scalar store on the hot path.
     #[inline]
     pub fn record_store(
         &mut self,
@@ -109,28 +100,17 @@ impl HeartbeatTracker {
         }
         let e = &mut self.entries[idx];
         e.last_value = value;
-        e.last_severity = severity;
+        e.last_severity = severity.max(0);
         e.last_status = status;
         e.last_store_at = now;
-        if e.heartbeat_s <= 0.0 && self.default_heartbeat_s > 0.0 {
-            e.heartbeat_s = self.default_heartbeat_s;
-        }
     }
 
-    /// Scan all PVs and emit heartbeats for stale ones.
-    ///
-    /// `active_pv_ids` is the set of currently subscribed pv_ids - entries not in
-    /// this set are auto-disabled (PV was unsubscribed).
     pub fn emit_heartbeats(
         &mut self,
         shared_buf: &SharedBuffer,
         active_pv_ids: &std::collections::HashSet<i32>,
     ) -> usize {
-        if self.is_disabled() {
-            return 0;
-        }
-
-        // Hot-reload per-PV heartbeat_s from pv_config (via ArcSwap).
+        // Hot-reload check
         {
             let cfg = self.config_source.load();
             let ptr = Arc::as_ptr(&*cfg) as usize;
@@ -142,25 +122,41 @@ impl HeartbeatTracker {
             }
         }
 
+        if self.is_disabled() {
+            return 0;
+        }
+
         let now = Instant::now();
         let now_pg_us = {
             let utc = chrono::Utc::now();
             utc.timestamp_micros() - aura_store::writer::copy_pool::PG_EPOCH_OFFSET_US
         };
 
+        let default_hs = self.default_heartbeat_s;
         let mut count = 0;
+
         for (pv_id, entry) in self.entries.iter_mut().enumerate() {
-            if entry.heartbeat_s <= 0.0 {
+            let hs = if entry.heartbeat_s < 0.0 {
+                default_hs
+            } else {
+                entry.heartbeat_s
+            };
+
+            if hs <= 0.0 {
                 continue;
             }
 
             if !active_pv_ids.contains(&(pv_id as i32)) {
-                entry.heartbeat_s = 0.0;
+                entry.last_severity = -1; // Unsubscribed: invalidate cached value
+                continue;
+            }
+
+            if entry.last_severity < 0 {
                 continue;
             }
 
             let elapsed = now.duration_since(entry.last_store_at).as_secs_f32();
-            if elapsed < entry.heartbeat_s {
+            if elapsed < hs {
                 continue;
             }
 
@@ -175,6 +171,7 @@ impl HeartbeatTracker {
             entry.last_store_at = now;
             count += 1;
         }
+
         count
     }
 }
@@ -201,7 +198,6 @@ mod tests {
         Arc::new(ArcSwap::from_pointee(Vec::new()))
     }
 
-    /// Helper: set last_store_at to 1 second in the past for a PV.
     fn age_pv(t: &mut HeartbeatTracker, pv_id: i32) {
         let idx = pv_id as usize;
         if idx < t.entries.len() {
@@ -327,5 +323,51 @@ mod tests {
         let mut t = HeartbeatTracker::new(60.0, empty_config());
         t.record_store(3_000_000, 1.0, 0, 0, Instant::now());
         assert!(t.entries.is_empty());
+    }
+
+    #[test]
+    fn explicit_disable_survives_record_store() {
+        let mut t = HeartbeatTracker::new(0.5, empty_config());
+        t.set_pv_heartbeat(2, 0.0);
+        let past = Instant::now() - Duration::from_secs(1);
+        t.record_store(2, 2.0, 0, 0, past);
+        let buf = make_buf();
+        assert_eq!(t.emit_heartbeats(&buf, &active(&[2])), 0);
+    }
+
+    #[test]
+    fn no_fabricated_value_before_first_event() {
+        let mut t = HeartbeatTracker::new(0.5, empty_config());
+        t.set_pv_heartbeat(3, 0.5);
+        t.entries[3].last_store_at = Instant::now() - Duration::from_secs(10);
+        let buf = make_buf();
+        assert_eq!(t.emit_heartbeats(&buf, &active(&[3])), 0);
+        assert!(buf.take_scalars().is_empty());
+    }
+
+    #[test]
+    fn override_works_when_global_disabled() {
+        let cfg = empty_config();
+        let mut t = HeartbeatTracker::new(0.0, cfg.clone());
+        let past = Instant::now() - Duration::from_secs(2);
+        t.record_store(1, 7.0, 0, 0, past);
+        cfg.store(Arc::new(vec![(1, 1.0)]));
+        let buf = make_buf();
+        assert_eq!(t.emit_heartbeats(&buf, &active(&[1])), 1);
+        let rows = buf.take_scalars();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].value - 7.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn unset_sentinel_falls_back_to_default() {
+        let mut t = HeartbeatTracker::new(0.5, empty_config());
+        let past = Instant::now() - Duration::from_secs(1);
+        t.record_store(1, 1.0, 0, 0, past);
+        t.set_pv_heartbeat(1, 3600.0);
+        let buf = make_buf();
+        assert_eq!(t.emit_heartbeats(&buf, &active(&[1])), 0);
+        t.set_pv_heartbeat(1, -1.0);
+        assert_eq!(t.emit_heartbeats(&buf, &active(&[1])), 1);
     }
 }

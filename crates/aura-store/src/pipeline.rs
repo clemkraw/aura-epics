@@ -18,6 +18,8 @@
 //!   so dispatch continues while the previous batch flushes in background.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use sqlx::postgres::PgPool;
@@ -35,6 +37,10 @@ pub struct PipelineConfig {
     pub min_batch_size: usize,
     /// Maximum batch size for adaptive batching.
     pub max_batch_size: usize,
+    /// Database URL, used to heal dead COPY connections after a PostgreSQL
+    /// restart (tokio-postgres clients never reconnect on their own).
+    /// Empty disables healing (and the store loop will say so).
+    pub database_url: String,
 }
 
 impl Default for PipelineConfig {
@@ -43,6 +49,7 @@ impl Default for PipelineConfig {
             max_flush_interval_ms: 100,
             min_batch_size: 500,
             max_batch_size: 200_000,
+            database_url: String::new(),
         }
     }
 }
@@ -53,6 +60,7 @@ impl PipelineConfig {
             max_flush_interval_ms: config.store.flush_interval_ms,
             min_batch_size: 500,
             max_batch_size: config.store.batch_size,
+            database_url: config.database.url.clone(),
         }
     }
 }
@@ -68,6 +76,13 @@ pub struct Pipeline {
     total_flush_us: u64,
     total_received: u64,
     total_stored: u64,
+
+    /// Rows definitively lost by the storage path (COPY retries exhausted,
+    /// failed final flush at shutdown…). Shared so operators/benchmarks can
+    /// observe it from outside the store loop: clone via
+    /// [`Pipeline::rows_lost_counter`] BEFORE moving the pipeline into
+    /// `store_loop::run`.
+    rows_lost: Arc<AtomicU64>,
 }
 
 impl Pipeline {
@@ -88,15 +103,19 @@ impl Pipeline {
             total_flush_us: 0,
             total_received: 0,
             total_stored: 0,
+            rows_lost: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Warm PV cache at startup.
-    pub async fn startup(&mut self, pool: &PgPool) -> AuraResult<()> {
+    /// Returns the number of PV entries actually warmed into the writer
+    /// cache, so callers can verify it against their expectations (the
+    /// bench asserts it equals the registered PV count).
+    pub async fn startup(&mut self, pool: &PgPool) -> AuraResult<usize> {
         let cached = self.writer.warm_cache(pool).await?;
         tracing::info!(cached_pvs = cached, "PV cache warmed");
         self.last_flush = Instant::now();
-        Ok(())
+        Ok(cached)
     }
 
     #[inline]
@@ -125,6 +144,14 @@ impl Pipeline {
         self.should_time_flush()
     }
 
+    /// Time remaining until the next time-based flush becomes due.
+    /// Zero if a flush is already due. Lets the store loop sleep exactly
+    /// until the deadline instead of spinning.
+    #[inline]
+    pub fn time_to_next_flush(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.config.max_flush_interval_ms)
+            .saturating_sub(self.last_flush.elapsed())
+    }
 
     #[inline]
     pub fn reset_last_flush(&mut self) {
@@ -169,6 +196,32 @@ impl Pipeline {
         self.writer.array_writer_mut().set_copy_pool(pool.clone());
         self.writer.json_writer_mut().set_copy_pool(pool.clone());
         self.writer.image_writer_mut().set_copy_pool(pool);
+    }
+
+    /// Handle on the lost-rows counter. Clone it BEFORE moving the pipeline
+    /// into `store_loop::run` if you need to observe losses from outside
+    /// (operators, benchmarks, tests).
+    pub fn rows_lost_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.rows_lost)
+    }
+
+    /// Re-establish dead COPY connections (no-op when none are dead).
+    ///
+    /// Called by the store loop before retrying a failed bundle and before
+    /// the final shutdown flush: after a PostgreSQL restart the
+    /// tokio-postgres clients are closed forever, and retrying on them can
+    /// only fail. Returns `(reconnected, still_dead)`.
+    pub async fn heal_copy_connections(&self) -> (usize, usize) {
+        if self.config.database_url.is_empty() {
+            tracing::warn!(
+                "cannot heal COPY connections: PipelineConfig.database_url is empty                  (build the config via PipelineConfig::from_aura_config)"
+            );
+            return (0, 0);
+        }
+        self.writer
+            .copy_pool()
+            .reconnect_dead(&self.config.database_url)
+            .await
     }
 
     #[inline]

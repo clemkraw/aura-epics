@@ -454,11 +454,15 @@ mod tests {
         assert_eq!(w.push(row(3, "c")), PushResult::Full);
     }
 
-    #[test] fn backpressure_triggered() {
+    #[test]
+    fn backpressure_triggered() {
         let mut w = StringWriter::with_limits(100, 1024);
         w.push(row(1, &"x".repeat(500))); // 540 bytes
         w.push(row(2, &"y".repeat(400))); // 440 bytes -> 980
-        assert_eq!(w.push(row(3, &"z".repeat(100))), PushResult::BackpressureExceeded); // 980+140 > 1024
+        assert_eq!(
+            w.push(row(3, &"z".repeat(100))),
+            PushResult::BackpressureExceeded
+        ); // 980+140 > 1024
         assert_eq!(w.len(), 2);
     }
 

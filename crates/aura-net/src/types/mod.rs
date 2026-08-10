@@ -9,5 +9,5 @@
 pub mod pva_value;
 pub mod to_normative;
 
-pub use pva_value::{PvaValue, PvaScalar, decode_scalar};
+pub use pva_value::{PvaScalar, PvaValue, decode_scalar};
 pub use to_normative::to_normative;

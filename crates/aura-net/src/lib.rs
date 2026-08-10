@@ -24,16 +24,16 @@
 //! let results = driver.monitor_batch(&["PERLE:Gun:Vacuum".into()]).await;
 //! ```
 
+pub mod client;
 pub mod codec;
 pub mod messages;
-pub mod types;
-pub mod client;
 pub mod monitor;
 pub mod runtime;
+pub mod types;
 
-pub use runtime::PvaDriver;
 pub use client::PvaClientConfig;
+pub use runtime::PvaDriver;
 
-pub use monitor::{MonitorHandle, MonitorEvent};
 pub use monitor::bus::{TaggedEvent, create_bus, shard_for_pv};
+pub use monitor::{MonitorEvent, MonitorHandle};
 pub use types::PvaValue;

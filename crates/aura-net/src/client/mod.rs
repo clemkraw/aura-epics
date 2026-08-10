@@ -5,5 +5,5 @@ pub mod connection;
 pub mod pool;
 
 pub use config::PvaClientConfig;
-pub use connection::{ConnectionState, ChannelState, next_client_id};
+pub use connection::{ChannelState, ConnectionState, next_client_id};
 pub use pool::SessionPool;

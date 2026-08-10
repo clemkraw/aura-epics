@@ -7,10 +7,10 @@
 //! tcp.rs      — Raw async TCP with PVA framing
 //! ```
 
-pub mod tcp;
+pub mod driver;
 pub mod handshake;
 pub mod session;
-pub mod driver;
+pub mod tcp;
 
 pub use driver::PvaDriver;
 pub use session::PvaSession;

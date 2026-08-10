@@ -29,13 +29,21 @@ impl TimeStamp {
     /// Create a timestamp with no user tag.
     #[inline]
     pub fn new(seconds: i64, nanoseconds: u32) -> Self {
-        Self { seconds, nanoseconds, user_tag: 0 }
+        Self {
+            seconds,
+            nanoseconds,
+            user_tag: 0,
+        }
     }
 
     /// Create a timestamp with a user tag.
     #[inline]
     pub fn with_tag(seconds: i64, nanoseconds: u32, user_tag: i32) -> Self {
-        Self { seconds, nanoseconds, user_tag }
+        Self {
+            seconds,
+            nanoseconds,
+            user_tag,
+        }
     }
 
     pub fn now() -> Self {
@@ -45,8 +53,7 @@ impl TimeStamp {
     /// Convert to `chrono::DateTime<Utc>`.
     #[inline]
     pub fn to_datetime(&self) -> DateTime<Utc> {
-        DateTime::from_timestamp(self.seconds, self.nanoseconds)
-            .unwrap_or_default()
+        DateTime::from_timestamp(self.seconds, self.nanoseconds).unwrap_or_default()
     }
 
     /// Create from `chrono::DateTime<Utc>`.

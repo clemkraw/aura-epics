@@ -119,11 +119,11 @@ pub async fn perform_handshake(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
     use super::*;
     use crate::codec::header::PvaHeader;
     use crate::codec::pvdata::PvaWriter;
     use crate::messages::ConnectionValidation;
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 

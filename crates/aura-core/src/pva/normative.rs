@@ -7,16 +7,16 @@
 //!
 //! NTURI is omitted (RPC request type, not archivable).
 
-use serde::{Deserialize, Serialize};
 use super::alarm::Alarm;
 use super::arrays::ArrayValue;
 use super::display::{Control, Display, ValueAlarm};
 use super::enums::EnumValue;
 use super::ndarray::{Codec, Dimension, NdAttribute};
-use super::scalars::{ScalarValue};
+use super::scalars::ScalarValue;
 use super::table::{HistogramValue, TableColumn};
 use super::time::TimeStamp;
 use super::union::UnionValue;
+use serde::{Deserialize, Serialize};
 
 /// `epics:nt/NTScalar:1.0`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,12 +78,20 @@ pub struct NTMatrix {
 
 impl NTMatrix {
     pub fn rows(&self) -> usize {
-        if self.dim.len() >= 2 { self.dim[0] as usize } else { 1 }
+        if self.dim.len() >= 2 {
+            self.dim[0] as usize
+        } else {
+            1
+        }
     }
     pub fn cols(&self) -> usize {
-        if self.dim.len() >= 2 { self.dim[1] as usize }
-        else if self.dim.len() == 1 { self.dim[0] as usize }
-        else { self.value.len() }
+        if self.dim.len() >= 2 {
+            self.dim[1] as usize
+        } else if self.dim.len() == 1 {
+            self.dim[0] as usize
+        } else {
+            self.value.len()
+        }
     }
     pub fn get(&self, row: usize, col: usize) -> Option<f64> {
         self.value.get(row * self.cols() + col).copied()
@@ -104,7 +112,9 @@ pub struct NTHistogram {
 }
 
 impl NTHistogram {
-    pub fn bin_count(&self) -> usize { self.value.len() }
+    pub fn bin_count(&self) -> usize {
+        self.value.len()
+    }
 }
 
 /// `epics:nt/NTContinuum:1.0` — multi-trace time/frequency domain data.
@@ -122,13 +132,21 @@ pub struct NTContinuum {
 }
 
 impl NTContinuum {
-    pub fn point_count(&self) -> usize { self.base.len() }
+    pub fn point_count(&self) -> usize {
+        self.base.len()
+    }
     pub fn trace_count(&self) -> usize {
-        if self.base.is_empty() { 0 } else { self.value.len() / self.base.len() }
+        if self.base.is_empty() {
+            0
+        } else {
+            self.value.len() / self.base.len()
+        }
     }
     pub fn get(&self, point: usize, trace: usize) -> Option<f64> {
         let n = self.trace_count();
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         self.value.get(point * n + trace).copied()
     }
 }
@@ -147,8 +165,12 @@ pub struct NTNameValue {
 }
 
 impl NTNameValue {
-    pub fn len(&self) -> usize { self.name.len() }
-    pub fn is_empty(&self) -> bool { self.name.is_empty() }
+    pub fn len(&self) -> usize {
+        self.name.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.name.is_empty()
+    }
 }
 
 /// `epics:nt/NTTable:1.0` — columnar table.
@@ -166,7 +188,9 @@ impl NTTable {
     pub fn row_count(&self) -> usize {
         self.columns.first().map(|c| c.values.len()).unwrap_or(0)
     }
-    pub fn column_count(&self) -> usize { self.columns.len() }
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
 }
 
 /// `epics:nt/NTNDArray:1.0` — N-dimensional image/detector data.
@@ -281,24 +305,36 @@ pub enum NormativeType {
 impl NormativeType {
     pub fn alarm(&self) -> &Alarm {
         match self {
-            Self::NTScalar(nt) => &nt.alarm, Self::NTEnum(nt) => &nt.alarm,
-            Self::NTScalarArray(nt) => &nt.alarm, Self::NTMatrix(nt) => &nt.alarm,
-            Self::NTHistogram(nt) => &nt.alarm, Self::NTContinuum(nt) => &nt.alarm,
-            Self::NTNameValue(nt) => &nt.alarm, Self::NTTable(nt) => &nt.alarm,
-            Self::NTNDArray(nt) => &nt.alarm, Self::NTMultiChannel(nt) => &nt.alarm,
-            Self::NTAggregate(nt) => &nt.alarm, Self::NTUnion(nt) => &nt.alarm,
+            Self::NTScalar(nt) => &nt.alarm,
+            Self::NTEnum(nt) => &nt.alarm,
+            Self::NTScalarArray(nt) => &nt.alarm,
+            Self::NTMatrix(nt) => &nt.alarm,
+            Self::NTHistogram(nt) => &nt.alarm,
+            Self::NTContinuum(nt) => &nt.alarm,
+            Self::NTNameValue(nt) => &nt.alarm,
+            Self::NTTable(nt) => &nt.alarm,
+            Self::NTNDArray(nt) => &nt.alarm,
+            Self::NTMultiChannel(nt) => &nt.alarm,
+            Self::NTAggregate(nt) => &nt.alarm,
+            Self::NTUnion(nt) => &nt.alarm,
             Self::Custom(nt) => &nt.alarm,
         }
     }
 
     pub fn timestamp(&self) -> &TimeStamp {
         match self {
-            Self::NTScalar(nt) => &nt.timestamp, Self::NTEnum(nt) => &nt.timestamp,
-            Self::NTScalarArray(nt) => &nt.timestamp, Self::NTMatrix(nt) => &nt.timestamp,
-            Self::NTHistogram(nt) => &nt.timestamp, Self::NTContinuum(nt) => &nt.timestamp,
-            Self::NTNameValue(nt) => &nt.timestamp, Self::NTTable(nt) => &nt.timestamp,
-            Self::NTNDArray(nt) => &nt.timestamp, Self::NTMultiChannel(nt) => &nt.timestamp,
-            Self::NTAggregate(nt) => &nt.timestamp, Self::NTUnion(nt) => &nt.timestamp,
+            Self::NTScalar(nt) => &nt.timestamp,
+            Self::NTEnum(nt) => &nt.timestamp,
+            Self::NTScalarArray(nt) => &nt.timestamp,
+            Self::NTMatrix(nt) => &nt.timestamp,
+            Self::NTHistogram(nt) => &nt.timestamp,
+            Self::NTContinuum(nt) => &nt.timestamp,
+            Self::NTNameValue(nt) => &nt.timestamp,
+            Self::NTTable(nt) => &nt.timestamp,
+            Self::NTNDArray(nt) => &nt.timestamp,
+            Self::NTMultiChannel(nt) => &nt.timestamp,
+            Self::NTAggregate(nt) => &nt.timestamp,
+            Self::NTUnion(nt) => &nt.timestamp,
             Self::Custom(nt) => &nt.timestamp,
         }
     }
@@ -317,12 +353,18 @@ impl NormativeType {
     /// Short type name.
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::NTScalar(_) => "NTScalar", Self::NTEnum(_) => "NTEnum",
-            Self::NTScalarArray(_) => "NTScalarArray", Self::NTMatrix(_) => "NTMatrix",
-            Self::NTHistogram(_) => "NTHistogram", Self::NTContinuum(_) => "NTContinuum",
-            Self::NTNameValue(_) => "NTNameValue", Self::NTTable(_) => "NTTable",
-            Self::NTNDArray(_) => "NTNDArray", Self::NTMultiChannel(_) => "NTMultiChannel",
-            Self::NTAggregate(_) => "NTAggregate", Self::NTUnion(_) => "NTUnion",
+            Self::NTScalar(_) => "NTScalar",
+            Self::NTEnum(_) => "NTEnum",
+            Self::NTScalarArray(_) => "NTScalarArray",
+            Self::NTMatrix(_) => "NTMatrix",
+            Self::NTHistogram(_) => "NTHistogram",
+            Self::NTContinuum(_) => "NTContinuum",
+            Self::NTNameValue(_) => "NTNameValue",
+            Self::NTTable(_) => "NTTable",
+            Self::NTNDArray(_) => "NTNDArray",
+            Self::NTMultiChannel(_) => "NTMultiChannel",
+            Self::NTAggregate(_) => "NTAggregate",
+            Self::NTUnion(_) => "NTUnion",
             Self::Custom(_) => "Custom",
         }
     }
@@ -351,13 +393,19 @@ impl NormativeType {
 mod tests {
     use super::*;
 
-    fn ts() -> TimeStamp { TimeStamp::new(0, 0) }
+    fn ts() -> TimeStamp {
+        TimeStamp::new(0, 0)
+    }
 
     #[test]
     fn test_scalar() {
         let nt = NormativeType::NTScalar(NTScalar {
-            value: ScalarValue::Double(4.217), alarm: Alarm::default(),
-            timestamp: ts(), display: None, control: None, value_alarm: None,
+            value: ScalarValue::Double(4.217),
+            alarm: Alarm::default(),
+            timestamp: ts(),
+            display: None,
+            control: None,
+            value_alarm: None,
         });
         assert_eq!(nt.as_f64(), Some(4.217));
         assert_eq!(nt.type_id(), "epics:nt/NTScalar:1.0");
@@ -366,16 +414,26 @@ mod tests {
     #[test]
     fn test_enum() {
         let nt = NormativeType::NTEnum(NTEnum {
-            value: EnumValue { index: 2, choices: vec!["A".into(), "B".into(), "C".into()] },
-            alarm: Alarm::default(), timestamp: ts(),
+            value: EnumValue {
+                index: 2,
+                choices: vec!["A".into(), "B".into(), "C".into()],
+            },
+            alarm: Alarm::default(),
+            timestamp: ts(),
         });
         assert_eq!(nt.as_f64(), Some(2.0));
     }
 
     #[test]
     fn test_matrix() {
-        let m = NTMatrix { value: vec![1.0,2.0,3.0,4.0,5.0,6.0], dim: vec![2,3],
-            descriptor: String::new(), alarm: Alarm::default(), timestamp: ts(), display: None };
+        let m = NTMatrix {
+            value: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            dim: vec![2, 3],
+            descriptor: String::new(),
+            alarm: Alarm::default(),
+            timestamp: ts(),
+            display: None,
+        };
         assert_eq!(m.rows(), 2);
         assert_eq!(m.cols(), 3);
         assert_eq!(m.get(1, 2), Some(6.0));
@@ -383,18 +441,26 @@ mod tests {
 
     #[test]
     fn test_histogram() {
-        let h = NTHistogram { ranges: vec![0.0,1.0,2.0,3.0],
-            value: HistogramValue::Int(vec![5,10,3]), descriptor: String::new(),
-            alarm: Alarm::default(), timestamp: ts() };
+        let h = NTHistogram {
+            ranges: vec![0.0, 1.0, 2.0, 3.0],
+            value: HistogramValue::Int(vec![5, 10, 3]),
+            descriptor: String::new(),
+            alarm: Alarm::default(),
+            timestamp: ts(),
+        };
         assert_eq!(h.bin_count(), 3);
     }
 
     #[test]
     fn test_continuum() {
-        let c = NTContinuum { base: vec![0.0,1.0,2.0],
-            value: vec![1.0,0.5, 2.0,1.0, 3.0,1.5],
-            units: vec!["s".into(),"V".into(),"A".into()],
-            descriptor: String::new(), alarm: Alarm::default(), timestamp: ts() };
+        let c = NTContinuum {
+            base: vec![0.0, 1.0, 2.0],
+            value: vec![1.0, 0.5, 2.0, 1.0, 3.0, 1.5],
+            units: vec!["s".into(), "V".into(), "A".into()],
+            descriptor: String::new(),
+            alarm: Alarm::default(),
+            timestamp: ts(),
+        };
         assert_eq!(c.point_count(), 3);
         assert_eq!(c.trace_count(), 2);
         assert_eq!(c.get(2, 1), Some(1.5));
@@ -402,20 +468,33 @@ mod tests {
 
     #[test]
     fn test_name_value() {
-        let nv = NTNameValue { name: vec!["gain".into(), "offset".into()],
+        let nv = NTNameValue {
+            name: vec!["gain".into(), "offset".into()],
             value: ArrayValue::DoubleArray(vec![1.5, -0.3]),
-            descriptor: String::new(), alarm: Alarm::default(), timestamp: ts() };
+            descriptor: String::new(),
+            alarm: Alarm::default(),
+            timestamp: ts(),
+        };
         assert_eq!(nv.len(), 2);
     }
 
     #[test]
     fn test_table() {
-        let t = NTTable { labels: vec!["x".into(),"y".into()],
+        let t = NTTable {
+            labels: vec!["x".into(), "y".into()],
             columns: vec![
-                TableColumn { name: "x".into(), values: ArrayValue::DoubleArray(vec![1.0,2.0]) },
-                TableColumn { name: "y".into(), values: ArrayValue::DoubleArray(vec![3.0,4.0]) },
+                TableColumn {
+                    name: "x".into(),
+                    values: ArrayValue::DoubleArray(vec![1.0, 2.0]),
+                },
+                TableColumn {
+                    name: "y".into(),
+                    values: ArrayValue::DoubleArray(vec![3.0, 4.0]),
+                },
             ],
-            alarm: Alarm::default(), timestamp: ts() };
+            alarm: Alarm::default(),
+            timestamp: ts(),
+        };
         assert_eq!(t.row_count(), 2);
         assert_eq!(t.column_count(), 2);
     }
@@ -424,7 +503,10 @@ mod tests {
     fn test_union() {
         let nt = NormativeType::NTUnion(NTUnion {
             value: UnionValue::Scalar(ScalarValue::Double(42.0)),
-            descriptor: String::new(), alarm: Alarm::default(), timestamp: ts() });
+            descriptor: String::new(),
+            alarm: Alarm::default(),
+            timestamp: ts(),
+        });
         assert_eq!(nt.as_f64(), Some(42.0));
         assert_eq!(nt.type_id(), "epics:nt/NTUnion:1.0");
     }
@@ -432,15 +514,26 @@ mod tests {
     #[test]
     fn test_aggregate() {
         let nt = NormativeType::NTAggregate(NTAggregate {
-            value: 4.2, n: 100, dispersion: 0.01, first: 4.1, last: 4.3,
-            max: 4.5, min: 3.9, alarm: Alarm::default(), timestamp: ts() });
+            value: 4.2,
+            n: 100,
+            dispersion: 0.01,
+            first: 4.1,
+            last: 4.3,
+            max: 4.5,
+            min: 3.9,
+            alarm: Alarm::default(),
+            timestamp: ts(),
+        });
         assert_eq!(nt.as_f64(), Some(4.2));
     }
 
     #[test]
     fn test_custom() {
         let nt = NormativeType::Custom(CustomStructure {
-            data: serde_json::json!({"x": 1}), alarm: Alarm::default(), timestamp: ts() });
+            data: serde_json::json!({"x": 1}),
+            alarm: Alarm::default(),
+            timestamp: ts(),
+        });
         assert_eq!(nt.as_f64(), None);
         assert_eq!(nt.type_id(), "custom");
     }
@@ -449,22 +542,97 @@ mod tests {
     fn test_all_type_ids_valid() {
         // Every type_id must start with "epics:nt/" or be "custom"
         let types: Vec<NormativeType> = vec![
-            NormativeType::NTScalar(NTScalar { value: ScalarValue::Int(0), alarm: Alarm::default(), timestamp: ts(), display: None, control: None, value_alarm: None }),
-            NormativeType::NTEnum(NTEnum { value: EnumValue { index: 0, choices: vec![] }, alarm: Alarm::default(), timestamp: ts() }),
-            NormativeType::NTScalarArray(NTScalarArray { value: ArrayValue::DoubleArray(vec![]), alarm: Alarm::default(), timestamp: ts(), display: None, control: None, value_alarm: None }),
-            NormativeType::NTMatrix(NTMatrix { value: vec![], dim: vec![], descriptor: String::new(), alarm: Alarm::default(), timestamp: ts(), display: None }),
-            NormativeType::NTHistogram(NTHistogram { ranges: vec![], value: HistogramValue::Int(vec![]), descriptor: String::new(), alarm: Alarm::default(), timestamp: ts() }),
-            NormativeType::NTContinuum(NTContinuum { base: vec![], value: vec![], units: vec![], descriptor: String::new(), alarm: Alarm::default(), timestamp: ts() }),
-            NormativeType::NTNameValue(NTNameValue { name: vec![], value: ArrayValue::DoubleArray(vec![]), descriptor: String::new(), alarm: Alarm::default(), timestamp: ts() }),
-            NormativeType::NTTable(NTTable { labels: vec![], columns: vec![], alarm: Alarm::default(), timestamp: ts() }),
-            NormativeType::NTAggregate(NTAggregate { value: 0.0, n: 0, dispersion: 0.0, first: 0.0, last: 0.0, max: 0.0, min: 0.0, alarm: Alarm::default(), timestamp: ts() }),
-            NormativeType::NTUnion(NTUnion { value: UnionValue::Scalar(ScalarValue::Int(0)), descriptor: String::new(), alarm: Alarm::default(), timestamp: ts() }),
-            NormativeType::Custom(CustomStructure { data: serde_json::Value::Null, alarm: Alarm::default(), timestamp: ts() }),
+            NormativeType::NTScalar(NTScalar {
+                value: ScalarValue::Int(0),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+            NormativeType::NTEnum(NTEnum {
+                value: EnumValue {
+                    index: 0,
+                    choices: vec![],
+                },
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+            NormativeType::NTScalarArray(NTScalarArray {
+                value: ArrayValue::DoubleArray(vec![]),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+                control: None,
+                value_alarm: None,
+            }),
+            NormativeType::NTMatrix(NTMatrix {
+                value: vec![],
+                dim: vec![],
+                descriptor: String::new(),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+                display: None,
+            }),
+            NormativeType::NTHistogram(NTHistogram {
+                ranges: vec![],
+                value: HistogramValue::Int(vec![]),
+                descriptor: String::new(),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+            NormativeType::NTContinuum(NTContinuum {
+                base: vec![],
+                value: vec![],
+                units: vec![],
+                descriptor: String::new(),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+            NormativeType::NTNameValue(NTNameValue {
+                name: vec![],
+                value: ArrayValue::DoubleArray(vec![]),
+                descriptor: String::new(),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+            NormativeType::NTTable(NTTable {
+                labels: vec![],
+                columns: vec![],
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+            NormativeType::NTAggregate(NTAggregate {
+                value: 0.0,
+                n: 0,
+                dispersion: 0.0,
+                first: 0.0,
+                last: 0.0,
+                max: 0.0,
+                min: 0.0,
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+            NormativeType::NTUnion(NTUnion {
+                value: UnionValue::Scalar(ScalarValue::Int(0)),
+                descriptor: String::new(),
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
+            NormativeType::Custom(CustomStructure {
+                data: serde_json::Value::Null,
+                alarm: Alarm::default(),
+                timestamp: ts(),
+            }),
         ];
         for nt in &types {
             let id = nt.type_id();
-            assert!(id.starts_with("epics:nt/") || id == "custom",
-                    "bad type_id '{}' for {}", id, nt.type_name());
+            assert!(
+                id.starts_with("epics:nt/") || id == "custom",
+                "bad type_id '{}' for {}",
+                id,
+                nt.type_name()
+            );
         }
     }
 }

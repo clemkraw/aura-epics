@@ -72,10 +72,11 @@ impl std::fmt::Display for Alarm {
 ///
 /// Ordered by increasing severity: None < Minor < Major < Invalid.
 /// `Undefined` is used for unknown/unmapped values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[repr(i16)]
 pub enum AlarmSeverity {
     /// No alarm — value is within normal operating range.
+    #[default]
     None = 0,
     /// Minor alarm — value is approaching a limit (WARNING).
     Minor = 1,
@@ -89,7 +90,13 @@ pub enum AlarmSeverity {
 
 impl AlarmSeverity {
     /// All defined severity levels in order of increasing severity.
-    pub const ALL: [Self; 5] = [Self::None, Self::Minor, Self::Major, Self::Invalid, Self::Undefined];
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::Minor,
+        Self::Major,
+        Self::Invalid,
+        Self::Undefined,
+    ];
 }
 
 impl From<i16> for AlarmSeverity {
@@ -107,12 +114,6 @@ impl From<i16> for AlarmSeverity {
 impl From<AlarmSeverity> for i16 {
     fn from(v: AlarmSeverity) -> Self {
         v as i16
-    }
-}
-
-impl Default for AlarmSeverity {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -134,10 +135,11 @@ impl std::fmt::Display for AlarmSeverity {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Alarm status codes — identifies the source/cause of an alarm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[repr(i16)]
 pub enum AlarmStatus {
     /// No alarm condition.
+    #[default]
     None = 0,
     /// Alarm raised by the device/hardware.
     Device = 1,
@@ -158,8 +160,14 @@ pub enum AlarmStatus {
 impl AlarmStatus {
     /// All defined status codes.
     pub const ALL: [Self; 8] = [
-        Self::None, Self::Device, Self::Driver, Self::Record,
-        Self::Db, Self::Conf, Self::Undefined, Self::Client,
+        Self::None,
+        Self::Device,
+        Self::Driver,
+        Self::Record,
+        Self::Db,
+        Self::Conf,
+        Self::Undefined,
+        Self::Client,
     ];
 }
 
@@ -181,12 +189,6 @@ impl From<i16> for AlarmStatus {
 impl From<AlarmStatus> for i16 {
     fn from(v: AlarmStatus) -> Self {
         v as i16
-    }
-}
-
-impl Default for AlarmStatus {
-    fn default() -> Self {
-        Self::None
     }
 }
 
@@ -305,8 +307,12 @@ mod tests {
     #[test]
     fn test_severity_from_i16_unknown_maps_to_undefined() {
         for v in [5, 10, -1, 99, i16::MAX, i16::MIN] {
-            assert_eq!(AlarmSeverity::from(v), AlarmSeverity::Undefined,
-                       "value {} should map to Undefined", v);
+            assert_eq!(
+                AlarmSeverity::from(v),
+                AlarmSeverity::Undefined,
+                "value {} should map to Undefined",
+                v
+            );
         }
     }
 
@@ -349,7 +355,7 @@ mod tests {
     #[test]
     fn test_severity_copy() {
         let a = AlarmSeverity::Major;
-        let b = a;  // Copy, not move
+        let b = a; // Copy, not move
         assert_eq!(a, b);
     }
 
@@ -386,8 +392,12 @@ mod tests {
     #[test]
     fn test_status_from_i16_unknown_maps_to_undefined() {
         for v in [8, 10, -1, 99, i16::MAX, i16::MIN] {
-            assert_eq!(AlarmStatus::from(v), AlarmStatus::Undefined,
-                       "value {} should map to Undefined", v);
+            assert_eq!(
+                AlarmStatus::from(v),
+                AlarmStatus::Undefined,
+                "value {} should map to Undefined",
+                v
+            );
         }
     }
 

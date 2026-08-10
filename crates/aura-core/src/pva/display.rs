@@ -92,8 +92,9 @@ impl fmt::Display for Display {
 /// Display format hint — how to render the numeric value.
 ///
 /// Maps to the PVAccess `enum_t form` field inside `display_t`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum DisplayForm {
+    #[default]
     Default,
     String,
     Binary,
@@ -106,25 +107,24 @@ pub enum DisplayForm {
 impl DisplayForm {
     /// All 7 display form variants.
     pub const ALL: [Self; 7] = [
-        Self::Default, Self::String, Self::Binary, Self::Decimal,
-        Self::Hex, Self::Exponential, Self::Engineering,
+        Self::Default,
+        Self::String,
+        Self::Binary,
+        Self::Decimal,
+        Self::Hex,
+        Self::Exponential,
+        Self::Engineering,
     ];
-}
-
-impl Default for DisplayForm {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl fmt::Display for DisplayForm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Default     => "default",
-            Self::String      => "string",
-            Self::Binary      => "binary",
-            Self::Decimal     => "decimal",
-            Self::Hex         => "hex",
+            Self::Default => "default",
+            Self::String => "string",
+            Self::Binary => "binary",
+            Self::Decimal => "decimal",
+            Self::Hex => "hex",
             Self::Exponential => "exponential",
             Self::Engineering => "engineering",
         })
@@ -151,7 +151,11 @@ pub struct Control {
 
 impl Control {
     pub fn new(limit_low: f64, limit_high: f64) -> Self {
-        Self { limit_low, limit_high, min_step: 0.0 }
+        Self {
+            limit_low,
+            limit_high,
+            min_step: 0.0,
+        }
     }
 
     /// Whether control limits define a valid range (low < high).
@@ -178,7 +182,11 @@ impl Control {
 
 impl Default for Control {
     fn default() -> Self {
-        Self { limit_low: 0.0, limit_high: 0.0, min_step: 0.0 }
+        Self {
+            limit_low: 0.0,
+            limit_high: 0.0,
+            min_step: 0.0,
+        }
     }
 }
 
@@ -300,14 +308,19 @@ impl Default for ValueAlarm {
 impl fmt::Display for ValueAlarm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
-            f, "LOLO={} LOW={} HIGH={} HIHI={}",
-            self.low_alarm_limit, self.low_warning_limit,
-            self.high_warning_limit, self.high_alarm_limit
+            f,
+            "LOLO={} LOW={} HIGH={} HIHI={}",
+            self.low_alarm_limit,
+            self.low_warning_limit,
+            self.high_warning_limit,
+            self.high_alarm_limit
         )
     }
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[cfg(test)]
 mod tests {
@@ -390,9 +403,12 @@ mod tests {
     #[test]
     fn test_display_serde_roundtrip() {
         let d = Display {
-            limit_low: -10.0, limit_high: 50.0,
-            description: "Cryo temp".into(), units: "K".into(),
-            precision: 3, form: DisplayForm::Exponential,
+            limit_low: -10.0,
+            limit_high: 50.0,
+            description: "Cryo temp".into(),
+            units: "K".into(),
+            precision: 3,
+            form: DisplayForm::Exponential,
         };
         let json = serde_json::to_string(&d).unwrap();
         let back: Display = serde_json::from_str(&json).unwrap();
@@ -427,8 +443,13 @@ mod tests {
     #[test]
     fn test_display_form_display_all() {
         let expected = [
-            "default", "string", "binary", "decimal",
-            "hex", "exponential", "engineering",
+            "default",
+            "string",
+            "binary",
+            "decimal",
+            "hex",
+            "exponential",
+            "engineering",
         ];
         for (form, exp) in DisplayForm::ALL.iter().zip(expected.iter()) {
             assert_eq!(form.to_string(), *exp);
@@ -471,9 +492,9 @@ mod tests {
     #[test]
     fn test_control_is_in_range() {
         let c = Control::new(0.0, 10.0);
-        assert!(c.is_in_range(0.0));   // at lower bound
-        assert!(c.is_in_range(5.0));   // middle
-        assert!(c.is_in_range(10.0));  // at upper bound
+        assert!(c.is_in_range(0.0)); // at lower bound
+        assert!(c.is_in_range(5.0)); // middle
+        assert!(c.is_in_range(10.0)); // at upper bound
         assert!(!c.is_in_range(-0.1)); // below
         assert!(!c.is_in_range(10.1)); // above
     }
@@ -513,7 +534,11 @@ mod tests {
 
     #[test]
     fn test_control_serde_roundtrip() {
-        let c = Control { limit_low: -10.0, limit_high: 50.0, min_step: 0.01 };
+        let c = Control {
+            limit_low: -10.0,
+            limit_high: 50.0,
+            min_step: 0.01,
+        };
         let json = serde_json::to_string(&c).unwrap();
         let back: Control = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
@@ -538,10 +563,10 @@ mod tests {
     #[test]
     fn test_value_alarm_symmetric() {
         let va = ValueAlarm::symmetric(10.0, 2.0, 5.0);
-        assert_eq!(va.low_alarm_limit, 5.0);   // 10 - 5
-        assert_eq!(va.low_warning_limit, 8.0);  // 10 - 2
+        assert_eq!(va.low_alarm_limit, 5.0); // 10 - 5
+        assert_eq!(va.low_warning_limit, 8.0); // 10 - 2
         assert_eq!(va.high_warning_limit, 12.0); // 10 + 2
-        assert_eq!(va.high_alarm_limit, 15.0);  // 10 + 5
+        assert_eq!(va.high_alarm_limit, 15.0); // 10 + 5
         assert!(va.is_valid());
         assert!(va.active);
         assert_eq!(va.low_alarm_severity, AlarmSeverity::Major);

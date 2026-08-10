@@ -222,7 +222,10 @@ mod tests {
 
     #[test]
     fn test_array_element_type() {
-        assert_eq!(array_double().array_element_type(), Some(ScalarType::Double));
+        assert_eq!(
+            array_double().array_element_type(),
+            Some(ScalarType::Double)
+        );
         assert_eq!(scalar_double().array_element_type(), None);
         assert_eq!(structure().array_element_type(), None);
     }

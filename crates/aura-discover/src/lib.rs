@@ -11,13 +11,13 @@
 //! - `orchestrator`: spawn tasks, run reconciliation loop
 //! - `pg_notify`: PostgreSQL LISTEN/NOTIFY for real-time config changes
 
-pub mod config_poller;
 pub mod command_publisher;
-pub mod reconciler;
+pub mod config_poller;
 pub mod orchestrator;
 pub mod pg_notify;
+pub mod reconciler;
 
-pub use orchestrator::Orchestrator;
+pub use command_publisher::{COMMAND_CHANNEL, CommandBatch, IngestCommand};
 pub use config_poller::{ConfigPoller, PvChange};
-pub use reconciler::{Reconciler, Action};
-pub use command_publisher::{CommandBatch, IngestCommand, COMMAND_CHANNEL};
+pub use orchestrator::Orchestrator;
+pub use reconciler::{Action, Reconciler};

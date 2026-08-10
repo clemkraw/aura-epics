@@ -69,7 +69,7 @@ impl Segmentation {
             flags::SEG_FIRST => Self::First,
             flags::SEG_LAST => Self::Last,
             flags::SEG_MIDDLE => Self::Middle,
-            _ => Self::None
+            _ => Self::None,
         }
     }
 

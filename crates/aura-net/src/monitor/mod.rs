@@ -1,9 +1,9 @@
 //! PV monitor subscriptions — delta decoding and event dispatch.
 
-pub mod subscription;
-pub mod handle;
 pub mod bus;
+pub mod handle;
+pub mod subscription;
 
-pub use subscription::{MonitorEvent, MonitorSubscription, SubscriptionState};
+pub use bus::{MonitorBusRx, MonitorBusTx, TaggedEvent, create_bus};
 pub use handle::MonitorHandle;
-pub use bus::{MonitorBusTx, MonitorBusRx, TaggedEvent, create_bus};
+pub use subscription::{MonitorEvent, MonitorSubscription, SubscriptionState};

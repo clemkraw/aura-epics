@@ -74,7 +74,8 @@ impl EnumValue {
     /// Find the index for a given label (reverse lookup).
     /// Returns `None` if the label is not in the choices.
     pub fn index_of(&self, label: &str) -> Option<i32> {
-        self.choices.iter()
+        self.choices
+            .iter()
             .position(|s| s == label)
             .map(|i| i as i32)
     }
@@ -182,8 +183,8 @@ mod tests {
 
     #[test]
     fn test_is_valid() {
-        assert!(valve_enum().is_valid());       // index 1, 3 choices
-        assert!(binary_enum().is_valid());      // index 0, 2 choices
+        assert!(valve_enum().is_valid()); // index 1, 3 choices
+        assert!(binary_enum().is_valid()); // index 0, 2 choices
     }
 
     #[test]
