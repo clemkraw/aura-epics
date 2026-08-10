@@ -33,8 +33,7 @@ use sqlx::postgres::PgPool;
 
 use aura_core::error::{AuraError, AuraResult};
 
-/// Default maximum cache entries (prevents unbounded growth).
-const DEFAULT_MAX_ENTRIES: usize = 500_000;
+const DEFAULT_MAX_ENTRIES: usize = 8_000_000;
 
 /// Upsert SQL — race-safe across multiple aura-store instances.
 const UPSERT_SQL: &str = r#"
@@ -86,6 +85,15 @@ impl PvCache {
         if self.cache.len() >= self.max_entries {
             self.saturations += 1;
             self.misses += 1;
+            // Saturation must be LOUD: past the cap, every event for an
+            // uncached PV costs one SQL round-trip on the fallback path.
+            if self.saturations == 1 || self.saturations % 100_000 == 0 {
+                tracing::warn!(
+                    max_entries = self.max_entries,
+                    saturations = self.saturations,
+                    "PvCache saturated — uncached PVs now cost one SQL upsert per event"
+                );
+            }
             return self.upsert_pv_lookup(pv_name, pool).await;
         }
 
@@ -101,17 +109,32 @@ impl PvCache {
         self.cache.get(pv_name).copied()
     }
 
-    /// Pre-warm the cache by loading all entries from `pv_lookup`.
+    /// Pre-warm the cache by loading entries from `pv_lookup`.
+    ///
+    /// Bounded fetch (LIMIT max_entries + 1: no point materialising rows
+    /// the cache cannot hold), and truncation is an ERROR-level event —
+    /// a silently incomplete cache means SQL-per-event on the fallback
+    /// path for every PV that did not fit.
     pub async fn warm(&mut self, pool: &PgPool) -> AuraResult<usize> {
-        let rows = sqlx::query_as::<_, (i32, String)>(
-            "SELECT pv_id, pv_name FROM pv_lookup ORDER BY pv_id",
+        let limit = self.max_entries as i64 + 1;
+        let mut rows = sqlx::query_as::<_, (i32, String)>(
+            "SELECT pv_id, pv_name FROM pv_lookup ORDER BY pv_id LIMIT $1",
         )
+        .bind(limit)
         .fetch_all(pool)
         .await
         .map_err(|e| AuraError::database(format!("pv_lookup warm failed: {e}")))?;
 
-        let count = rows.len().min(self.max_entries);
-        for (id, name) in rows.into_iter().take(self.max_entries) {
+        if rows.len() > self.max_entries {
+            rows.truncate(self.max_entries);
+            tracing::error!(
+                max_entries = self.max_entries,
+                "pv_lookup holds MORE PVs than the cache cap — warm TRUNCATED; \
+                 raise DEFAULT_MAX_ENTRIES (writer/pv_cache.rs) for this deployment"
+            );
+        }
+        let count = rows.len();
+        for (id, name) in rows {
             self.cache.insert(Arc::from(&*name), id);
         }
 
