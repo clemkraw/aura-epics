@@ -56,13 +56,18 @@ mod sql {
          FROM pv_config WHERE pv_name ILIKE $1 ORDER BY pv_name LIMIT $2";
 }
 
-/// Clamp heartbeat to minimum 1s (0 is valid as "use global default",
-/// but any positive value below 1s is likely a mistake).
-fn validate_heartbeat(heartbeat_s: f64) -> f64 {
+/// Map the in-memory heartbeat to its SQL representation.
+///
+/// The DAO's historical contract is kept: `heartbeat_s <= 0.0` in a
+/// `PvConfig` means "use the global default", which is now stored as SQL
+/// `NULL`. Positive values are clamped to a 1 s minimum (anything below is
+/// likely a mistake). An explicit per-PV disable (SQL `0`) is intentionally
+/// not expressible through this DAO — set it with a direct UPDATE.
+fn validate_heartbeat(heartbeat_s: f64) -> Option<f64> {
     if heartbeat_s <= 0.0 {
-        0.0
+        None
     } else {
-        heartbeat_s.max(1.0)
+        Some(heartbeat_s.max(1.0))
     }
 }
 
@@ -248,7 +253,8 @@ struct PvConfigRow {
     pv_name: String,
     description: Option<String>,
     unit: Option<String>,
-    heartbeat_s: f64,
+    /// Nullable: NULL = use global default (see 003_pv_config.sql).
+    heartbeat_s: Option<f64>,
     expected_ioc: Option<String>,
     enabled: bool,
     created_at: DateTime<Utc>,
@@ -260,7 +266,10 @@ impl PvConfigRow {
         let mut cfg = PvConfig::new(self.pv_name);
         cfg.description = self.description;
         cfg.unit = self.unit;
-        cfg.heartbeat_s = self.heartbeat_s;
+        // In the in-memory PvConfig, 0.0 keeps its historical meaning of
+        // "use global default" — only the SQL representation differs
+        // (NULL = default, 0 = per-PV disable; see 003_pv_config.sql).
+        cfg.heartbeat_s = self.heartbeat_s.unwrap_or(0.0);
         cfg.enabled = self.enabled;
         cfg
     }
@@ -287,7 +296,7 @@ mod tests {
             pv_name: pv.to_string(),
             description: Some("test desc".to_string()),
             unit: Some("K".to_string()),
-            heartbeat_s: 30.0,
+            heartbeat_s: Some(30.0),
             expected_ioc: Some("10.0.1.5:5075".to_string()),
             enabled,
             created_at: Utc::now(),
@@ -311,7 +320,7 @@ mod tests {
             pv_name: "PV:TEST".to_string(),
             description: None,
             unit: None,
-            heartbeat_s: 0.0,
+            heartbeat_s: None, // SQL NULL = use global default
             expected_ioc: None,
             enabled: false,
             created_at: Utc::now(),
@@ -324,22 +333,22 @@ mod tests {
 
     #[test]
     fn test_validate_normal() {
-        assert_eq!(validate_heartbeat(30.0), 30.0);
+        assert_eq!(validate_heartbeat(30.0), Some(30.0));
     }
 
     #[test]
     fn test_validate_zero_heartbeat() {
-        assert_eq!(validate_heartbeat(0.0), 0.0); // 0 = use global default
+        assert_eq!(validate_heartbeat(0.0), None); // use global default -> SQL NULL
     }
 
     #[test]
     fn test_validate_sub_second_clamped() {
-        assert_eq!(validate_heartbeat(0.5), 1.0); // positive but too low → clamp to 1s
+        assert_eq!(validate_heartbeat(0.5), Some(1.0)); // positive but too low → clamp to 1s
     }
 
     #[test]
     fn test_validate_negative_heartbeat() {
-        assert_eq!(validate_heartbeat(-1.0), 0.0); // negative → treat as "use default"
+        assert_eq!(validate_heartbeat(-1.0), None); // negative → use default -> SQL NULL
     }
 
     #[test]
