@@ -6,11 +6,11 @@
 //! Every field has a sensible default - a minimal TOML with empty
 //! sections (`[redis]\n[database]\n...`) produces a valid config.
 
+use crate::AuraError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
-use crate::AuraError;
 
 /// Top-level configuration for the AURA system.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]

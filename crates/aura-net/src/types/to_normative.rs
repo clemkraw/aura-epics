@@ -217,9 +217,7 @@ fn convert_nt_ndarray(value: &PvaValue) -> Option<NormativeType> {
     let unique_id = value.field_i32("uniqueId").unwrap_or(0);
 
     // Data timestamp (separate from the main timestamp).
-    let data_timestamp = value
-        .field("dataTimeStamp")
-        .map(extract_timestamp_from);
+    let data_timestamp = value.field("dataTimeStamp").map(extract_timestamp_from);
 
     // Attributes: array of {name, value, source, sourceType}.
     let attribute = extract_nd_attributes(value.field("attribute"));

@@ -445,7 +445,8 @@ pub async fn run(
             match joined {
                 Ok(outcome) => {
                     total_written += outcome.report.total() as u64;
-                    let lost = outcome.lost_rows + outcome.retry.as_ref().map_or(0, |b| b.total_rows());
+                    let lost =
+                        outcome.lost_rows + outcome.retry.as_ref().map_or(0, |b| b.total_rows());
                     if lost > 0 {
                         rows_lost.fetch_add(lost as u64, Ordering::Relaxed);
                         tracing::error!(
@@ -488,6 +489,9 @@ pub async fn run(
             "Store loop terminated cleanly with recovered transient errors"
         );
     } else {
-        tracing::info!(total_written, "Store loop terminated cleanly with no data loss");
+        tracing::info!(
+            total_written,
+            "Store loop terminated cleanly with no data loss"
+        );
     }
 }

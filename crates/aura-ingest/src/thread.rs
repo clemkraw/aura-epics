@@ -36,7 +36,6 @@ pub fn run_ingest_shard(
     let mut last_heartbeat_scan = std::time::Instant::now();
 
     loop {
-
         let mut local_events = 0u64;
         let mut local_published = 0u64;
         let mut local_fast = 0u64;
