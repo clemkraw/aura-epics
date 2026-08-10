@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+# Security: Strict restriction of GITHUB_TOKEN permissions
+permissions:
+  contents: read
+
+# Performance: Cancel outdated runs on concurrent pushes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: Formatting (rustfmt)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4 # Automatically respects rust-toolchain.toml
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Linting (clippy)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4
+      - uses: Swatinem/rust-cache@f0deed1e0edfc266b02845248ab18388d32bf846 # v2.7.7
+      - run: cargo clippy --workspace --locked --all-targets --all-features
+
+  test:
+    name: Tests & Verification
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4
+      - uses: Swatinem/rust-cache@f0deed1e0edfc266b02845248ab18388d32bf846 # v2.7.7
+      - run: cargo test --workspace --locked --all-targets --all-features
+
+  docs:
+    name: Documentation Integrity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4
+      - uses: Swatinem/rust-cache@f0deed1e0edfc266b02845248ab18388d32bf846 # v2.7.7
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps --all-features
+
+  security-and-licenses:
+    name: Security & License Audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: EmbarkStudios/cargo-deny-action@3f9a781a360ab24e930925769225726e63eb6653 # v2.0.10
+        with:
+          command: check advisories licenses sources
