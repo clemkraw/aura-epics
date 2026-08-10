@@ -5,7 +5,7 @@ members = [
     "crates/aura-discover",
     "crates/aura-ingest",
     "crates/aura-store",
-    "bench",
+#    "bench",
 ]
 resolver = "2"
 

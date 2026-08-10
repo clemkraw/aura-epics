@@ -79,24 +79,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aura-bench"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "aura-core",
- "aura-ingest",
- "aura-net",
- "aura-store",
- "serde_json",
- "sqlx",
- "tokio",
- "tokio-postgres",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "aura-core"
 version = "0.1.0"
 dependencies = [
