@@ -1,13 +1,9 @@
-//! Migrations are embedded in the binary via `sqlx::migrate!()` and
-//! run in order on startup. This ensures the schema is always up-to-date
-//! without requiring external migration files at runtime.
-//!
 //! ## Migration order
 //!
 //! ```text
 //! 001_extensions              — TimescaleDB + pg_stat_statements
 //! 002_pv_lookup               — pv_id ↔ pv_name normalization table
-//! 003_pv_config               — PV archiving configuration (name, heartbeat, enabled)
+//! 003_pv_config               — PV archiving configuration (tri-state heartbeat_s: NULL=default, 0=off, >0=override)
 //! 004_pv_metadata             — PV metadata from PVA Normative Types (units, alarms, enum choices)
 //! 005_samples                 — main scalar + string hypertables (~90% of traffic)
 //! 006_samples_typed           — per-NT-type hypertables (image, json)

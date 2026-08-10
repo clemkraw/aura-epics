@@ -389,18 +389,20 @@ impl JsonWriter {
             pool.send_copy(0, COPY_CUSTOM, payload, n).await?;
         }
         if let Some((payload, n)) = nv_payload {
-            pool.send_copy(1 % pool.len(), COPY_NV, payload, n).await?;
+            pool.send_copy(1 % pool.len().max(1), COPY_NV, payload, n)
+                .await?;
         }
         if let Some((payload, n)) = hist_payload {
-            pool.send_copy(2 % pool.len(), COPY_HIST, payload, n)
+            pool.send_copy(2 % pool.len().max(1), COPY_HIST, payload, n)
                 .await?;
         }
         if let Some((payload, n)) = cont_payload {
-            pool.send_copy(3 % pool.len(), COPY_CONT, payload, n)
+            pool.send_copy(3 % pool.len().max(1), COPY_CONT, payload, n)
                 .await?;
         }
         if let Some((payload, n)) = mch_payload {
-            pool.send_copy(4 % pool.len(), COPY_MCH, payload, n).await?;
+            pool.send_copy(4 % pool.len().max(1), COPY_MCH, payload, n)
+                .await?;
         }
         self.total_send_us += t1.elapsed().as_micros() as u64;
 
