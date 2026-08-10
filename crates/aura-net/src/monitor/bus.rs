@@ -1,6 +1,7 @@
 //! Sharded monitor event bus — aggregated channel per ingest shard.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::subscription::MonitorEvent;
 
@@ -16,6 +17,7 @@ pub struct TaggedEvent {
 pub struct MonitorBusTx {
     txs: Arc<Vec<crossbeam_channel::Sender<TaggedEvent>>>,
     n_shards: usize,
+    dropped: Arc<AtomicU64>,
 }
 
 /// FNV-1a hash for shard assignment.
@@ -38,11 +40,23 @@ impl MonitorBusTx {
         shard: usize,
         event: MonitorEvent,
     ) -> Result<(), crossbeam_channel::TrySendError<TaggedEvent>> {
-        self.txs[shard].try_send(TaggedEvent {
+        let result = self.txs[shard].try_send(TaggedEvent {
             pv_name,
             pv_id,
             event,
-        })
+        });
+        if result.is_err() {
+            // Counted here (not at call sites) so that no `let _ =` can
+            // ever make a drop invisible again.
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Total events dropped on full shard channels since startup.
+    #[inline]
+    pub fn total_dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn n_shards(&self) -> usize {
@@ -86,6 +100,7 @@ pub fn create_bus(n_shards: usize, buffer_per_shard: usize) -> (MonitorBusTx, Ve
     let bus_tx = MonitorBusTx {
         txs: Arc::new(txs),
         n_shards,
+        dropped: Arc::new(AtomicU64::new(0)),
     };
 
     (bus_tx, rxs)
@@ -288,6 +303,20 @@ mod tests {
         }
         let (n, id, ev) = disconnect("PV", 99);
         assert!(tx.send_to_shard(n, id, 0, ev).is_err());
+        assert_eq!(tx.total_dropped(), 1);
+    }
+
+    #[test]
+    fn dropped_counter_shared_across_clones() {
+        let (tx, _rxs) = create_bus(1, 1);
+        let tx2 = tx.clone();
+        let (n1, id1, ev1) = disconnect("PV", 1);
+        tx.send_to_shard(n1, id1, 0, ev1).unwrap();
+        let (n2, id2, ev2) = disconnect("PV", 2);
+        assert!(tx2.send_to_shard(n2, id2, 0, ev2).is_err());
+        // The drop on the clone is visible from the original handle.
+        assert_eq!(tx.total_dropped(), 1);
+        assert_eq!(tx2.total_dropped(), 1);
     }
 
     #[test]

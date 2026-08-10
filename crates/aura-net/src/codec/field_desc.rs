@@ -289,11 +289,9 @@ impl FieldDesc {
     fn decode_full(reader: &mut PvaReader<'_>) -> Result<Self, DecodeError> {
         let tag = reader.read_u8()?;
         match tag {
-            NULL_TYPE_CODE => {
-                Err(DecodeError::Protocol(
-                    "unexpected NULL_TYPE_CODE in nested field".into(),
-                ))
-            }
+            NULL_TYPE_CODE => Err(DecodeError::Protocol(
+                "unexpected NULL_TYPE_CODE in nested field".into(),
+            )),
             ONLY_ID_TYPE_CODE => {
                 let _id = reader.read_i16()?;
                 Err(DecodeError::Protocol(format!(
@@ -408,7 +406,11 @@ impl FieldDesc {
             }
             0x86 => {
                 let bound = reader.read_size_non_null()?;
-                Ok(Self { field_type: FieldType::BoundedString(bound), type_id: String::new(), fields: Vec::new() })
+                Ok(Self {
+                    field_type: FieldType::BoundedString(bound),
+                    type_id: String::new(),
+                    fields: Vec::new(),
+                })
             }
             0x81 => Ok(Self {
                 field_type: FieldType::VariantUnion,

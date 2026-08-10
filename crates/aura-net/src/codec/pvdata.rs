@@ -79,7 +79,6 @@ impl<'a> PvaReader<'a> {
         Ok(slice)
     }
 
-
     #[inline]
     pub fn read_u8(&mut self) -> Result<u8, DecodeError> {
         self.ensure(1)?;

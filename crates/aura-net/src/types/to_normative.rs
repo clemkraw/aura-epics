@@ -181,12 +181,10 @@ fn convert_nt_table(value: &PvaValue) -> Option<NormativeType> {
     // PVA tables store columns in a "value" structure where each
     // sub-field is a named array column.
     let mut columns = Vec::new();
-    if let Some(val_struct) = value.field("value") {
-        if let PvaValue::Structure(fields) = val_struct {
-            for (name, col_val) in fields {
-                if let Some(arr) = extract_array_value(col_val) {
-                    columns.push(TableColumn::new(name.to_string(), arr));
-                }
+    if let Some(PvaValue::Structure(fields)) = value.field("value") {
+        for (name, col_val) in fields {
+            if let Some(arr) = extract_array_value(col_val) {
+                columns.push(TableColumn::new(name.to_string(), arr));
             }
         }
     }
@@ -221,7 +219,7 @@ fn convert_nt_ndarray(value: &PvaValue) -> Option<NormativeType> {
     // Data timestamp (separate from the main timestamp).
     let data_timestamp = value
         .field("dataTimeStamp")
-        .map(|ts| extract_timestamp_from(ts));
+        .map(extract_timestamp_from);
 
     // Attributes: array of {name, value, source, sourceType}.
     let attribute = extract_nd_attributes(value.field("attribute"));
@@ -265,7 +263,7 @@ pub fn extract_alarm(value: &PvaValue) -> Alarm {
 pub fn extract_timestamp(value: &PvaValue) -> TimeStamp {
     value
         .field("timeStamp")
-        .map(|ts| extract_timestamp_from(ts))
+        .map(extract_timestamp_from)
         .unwrap_or_default()
 }
 
@@ -440,24 +438,22 @@ fn extract_array_value(val: &PvaValue) -> Option<ArrayValue> {
 fn extract_dimensions(val: Option<&PvaValue>) -> Vec<Dimension> {
     match val {
         Some(PvaValue::ScalarArray(_)) => vec![], // wrong type
-        Some(PvaValue::Structure(fields)) => {
-            fields
-                .iter()
-                .filter_map(|(_, dim)| {
-                    Some(Dimension {
-                        size: dim.field_i32("size")?,
-                        offset: dim.field_i32("offset").unwrap_or(0),
-                        full_size: dim.field_i32("fullSize").unwrap_or(0),
-                        binning: dim.field_i32("binning").unwrap_or(1),
-                        reverse: dim
-                            .field("reverse")
-                            .and_then(|v| v.as_scalar())
-                            .map(|s| matches!(s, PvaScalar::Boolean(true)))
-                            .unwrap_or(false),
-                    })
+        Some(PvaValue::Structure(fields)) => fields
+            .iter()
+            .filter_map(|(_, dim)| {
+                Some(Dimension {
+                    size: dim.field_i32("size")?,
+                    offset: dim.field_i32("offset").unwrap_or(0),
+                    full_size: dim.field_i32("fullSize").unwrap_or(0),
+                    binning: dim.field_i32("binning").unwrap_or(1),
+                    reverse: dim
+                        .field("reverse")
+                        .and_then(|v| v.as_scalar())
+                        .map(|s| matches!(s, PvaScalar::Boolean(true)))
+                        .unwrap_or(false),
                 })
-                .collect()
-        }
+            })
+            .collect(),
         _ => vec![],
     }
 }
@@ -488,12 +484,16 @@ fn pva_value_to_json(val: &PvaValue) -> serde_json::Value {
     match val {
         PvaValue::Scalar(s) => match s {
             PvaScalar::Boolean(v) => serde_json::Value::Bool(*v),
-            PvaScalar::String(v)  => serde_json::Value::String(v.clone()),
+            PvaScalar::String(v) => serde_json::Value::String(v.clone()),
             _ => match s {
-                PvaScalar::Float(_) | PvaScalar::Double(_) =>
-                    s.as_f64().map(|f| serde_json::json!(f)).unwrap_or(serde_json::Value::Null),
-                _ =>
-                    s.as_i64().map(|i| serde_json::json!(i)).unwrap_or(serde_json::Value::Null),
+                PvaScalar::Float(_) | PvaScalar::Double(_) => s
+                    .as_f64()
+                    .map(|f| serde_json::json!(f))
+                    .unwrap_or(serde_json::Value::Null),
+                _ => s
+                    .as_i64()
+                    .map(|i| serde_json::json!(i))
+                    .unwrap_or(serde_json::Value::Null),
             },
         },
         PvaValue::ScalarArray(arr) => serde_json::Value::Array(
@@ -501,7 +501,8 @@ fn pva_value_to_json(val: &PvaValue) -> serde_json::Value {
                 .map(|s| match s {
                     PvaScalar::String(v) => serde_json::Value::String(v.clone()),
                     PvaScalar::Boolean(v) => serde_json::Value::Bool(*v),
-                    _ => s.as_i64()
+                    _ => s
+                        .as_i64()
                         .map(|i| serde_json::json!(i))
                         .or_else(|| s.as_f64().map(|f| serde_json::json!(f)))
                         .unwrap_or(serde_json::Value::Null),

@@ -939,21 +939,19 @@ impl PvaSession {
             writer.clear();
             writer.write_u16(1);
             writer.write_i32(client_id);
-            writer.write_string(&**pv_name);
+            writer.write_string(pv_name);
             self.tcp.buffer_msg(CMD_CREATE_CHANNEL, writer.as_bytes());
             self.state.messages_sent += 1;
             sent += 1;
             // Flush every 10k to keep TCP buffer from growing unbounded.
-            if sent % 10_000 == 0 {
-                if let Err(_) = self.tcp.flush_writes().await {
-                    for (_, pv) in &id_to_pv {
-                        results.push((
-                            pv.to_string(),
-                            Err(SessionError::Protocol("flush failed".into())),
-                        ));
-                    }
-                    return results;
+            if sent.is_multiple_of(10_000) && self.tcp.flush_writes().await.is_err() {
+                for (_, pv) in &id_to_pv {
+                    results.push((
+                        pv.to_string(),
+                        Err(SessionError::Protocol("flush failed".into())),
+                    ));
                 }
+                return results;
             }
         }
         if let Err(_) = self.tcp.flush_writes().await {

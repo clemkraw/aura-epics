@@ -733,9 +733,7 @@ impl PvaDriver {
     /// Drain all pending metadata (O(1) swap). Scales to 1M+ PVs.
     pub fn set_pv_cache(
         &mut self,
-        cache: std::sync::Arc<
-            arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>,
-        >,
+        cache: std::sync::Arc<arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>>,
     ) {
         self.pv_cache = Some(cache);
     }

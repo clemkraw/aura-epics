@@ -14,7 +14,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::codec::field_desc::{IntrospectionRegistry};
+use crate::codec::field_desc::IntrospectionRegistry;
 use crate::codec::header::ByteOrder;
 
 /// Unique ID generator for client channel/request IDs.
