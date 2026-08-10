@@ -136,9 +136,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let num_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let ingest_threads = (num_cores / 4).max(2).min(16); // 8C → 4 threads au lieu de 8
+    let ingest_threads = (num_cores / 4).max(2).min(16); // 16 logical CPUs -> 4 ingest threads
 
-    // Dynamic buffer sizing: 5% of system RAM, min 2M, max 20M total.
+    // Dynamic buffer sizing: 2% of system RAM (/50), clamped to 2M..20M rows total.
     let total_ram_mb = {
         let info = sys_info::mem_info().unwrap_or(sys_info::MemInfo {
             total: 8_000_000,
@@ -217,12 +217,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let shared_writer_buf = Arc::clone(&shared_writer_bufs[0]);
 
     let store_pool = pool.clone();
-    let redis_url_store = config.redis.url.clone();
-    let spill_counter = Arc::new(AtomicU64::new(0));
     let ingest_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let heartbeat_config: Arc<arc_swap::ArcSwap<Vec<(i32, f32)>>> =
         Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
-    let spill_counter_store = spill_counter.clone();
     let store_cancel = tokio_util::sync::CancellationToken::new();
     let store_cancel_trigger = store_cancel.clone();
 
@@ -231,8 +228,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         shared_writer_bufs_store,
         sample_rx,
         store_pool,
-        redis_url_store,
-        spill_counter_store,
         store_cancel,
         store_notify.clone(),
     ));
@@ -333,6 +328,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Events flow: session -> bus_tx -> shard_rx -> ingest thread.
     // This replaces 16k+ per-PV channels with N shard channels.
     let (bus_tx, mut bus_rxs) = aura_net::create_bus(ingest_threads, 50_000);
+    let bus_tx_stats = bus_tx.clone(); // drop counter handle for the stats line
     driver.set_bus_tx(bus_tx);
 
     // Shared atomic counters for multi-threaded ingest stats.
@@ -456,10 +452,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Load per-PV heartbeat overrides from pv_config.
+    // Load per-PV heartbeat config from pv_config.
+    // Tri-state (003_pv_config.sql): NULL -> -1.0 sentinel (use global default),
+    // 0 -> disabled for this PV, > 0 -> override. NULLs are included so a PV
+    // reset from an override back to NULL follows the default again.
     {
         let hb_rows: Vec<(i32, f64)> = sqlx::query_as(
-            "SELECT l.pv_id, c.heartbeat_s FROM pv_config c JOIN pv_lookup l ON l.pv_name = c.pv_name WHERE c.heartbeat_s IS NOT NULL AND c.enabled = TRUE"
+            "SELECT l.pv_id, COALESCE(c.heartbeat_s, -1.0) FROM pv_config c JOIN pv_lookup l ON l.pv_name = c.pv_name WHERE c.enabled = TRUE"
         ).fetch_all(&pool).await.unwrap_or_default();
         if !hb_rows.is_empty() {
             let overrides: Vec<(i32, f32)> =
@@ -553,6 +552,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Graceful shutdown on SIGTERM (Docker stop, systemd, Kubernetes) in
+    // addition to SIGINT (Ctrl-C). The stream is created ONCE before the
+    // loop: a stream recreated inside select! on every iteration could miss
+    // a signal delivered between two polls.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(not(unix))]
+    let mut sigterm = {
+        struct NeverSignal;
+        impl NeverSignal {
+            async fn recv(&mut self) -> Option<()> {
+                std::future::pending().await
+            }
+        }
+        NeverSignal
+    };
+    let mut shutdown_signal = "SIGINT";
+
     loop {
         tokio::select! {
             Some((addr, new_cmd_tx)) = reconnect_rx.recv() => {
@@ -587,9 +604,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     static TICK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if TICK_COUNT.fetch_add(1, Ordering::Relaxed) % 3 == 0 {
                         if let Ok(hb_rows) = sqlx::query_as::<_, (i32, f64)>(
-                            "SELECT l.pv_id, c.heartbeat_s FROM pv_config c \
+                            "SELECT l.pv_id, COALESCE(c.heartbeat_s, -1.0) FROM pv_config c \
                              JOIN pv_lookup l ON l.pv_name = c.pv_name \
-                             WHERE c.heartbeat_s IS NOT NULL AND c.enabled = TRUE"
+                             WHERE c.enabled = TRUE"
                         ).fetch_all(&pool).await {
                             let overrides: Vec<(i32, f32)> = hb_rows.iter().map(|&(id, hs)| (id, hs as f32)).collect();
                             heartbeat_config.store(Arc::new(overrides));
@@ -601,12 +618,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let ev = snap.events_received;
                 if ev > 0 {
                     let buf_drops: u64 = shared_writer_bufs.iter().map(|b| b.total_dropped()).sum();
-                    let spills = spill_counter.load(Ordering::Relaxed);
-                    println!("{c_met}[{}]{c_rst} {c_id}sta{c_rst}  events={c_val}{}{c_rst} pub={c_val}{}{c_rst} skip={c_val}{}{c_rst} dc={c_val}{}{c_rst} spill={c_val}{}{c_rst} buf_drop={c_val}{}{c_rst} sessions={c_val}{}{c_rst} fast={c_val}{}%{c_rst}",
+                    let bus_drops = bus_tx_stats.total_dropped();
+                    println!("{c_met}[{}]{c_rst} {c_id}sta{c_rst}  events={c_val}{}{c_rst} pub={c_val}{}{c_rst} skip={c_val}{}{c_rst} dc={c_val}{}{c_rst} bus_drop={c_val}{}{c_rst} buf_drop={c_val}{}{c_rst} drop_pv={c_val}{}{c_rst} sessions={c_val}{}{c_rst} fast={c_val}{}%{c_rst}",
                         ts(), snap.events_received, snap.events_published,
                         snap.events_skipped, snap.disconnects,
-                        spills, buf_drops, driver.session_count(),
-                        snap.fast_path_pct);
+                        bus_drops, buf_drops, snap.events_dropped_unknown_pv,
+                        driver.session_count(), snap.fast_path_pct);
+
+                    // Data-loss alert: raised when the total drop count grows,
+                    // throttled to one alert_log row per ~5 min (30 ticks).
+                    {
+                        static LAST_TOTAL_DROPS: AtomicU64 = AtomicU64::new(0);
+                        static LAST_ALERT_TICK: AtomicU64 = AtomicU64::new(0);
+                        static DROP_TICK: AtomicU64 = AtomicU64::new(0);
+                        let tick = DROP_TICK.fetch_add(1, Ordering::Relaxed);
+                        let total = bus_drops + buf_drops + snap.events_dropped_unknown_pv;
+                        let prev = LAST_TOTAL_DROPS.swap(total, Ordering::Relaxed);
+                        let last_alert = LAST_ALERT_TICK.load(Ordering::Relaxed);
+                        if total > prev && (last_alert == 0 || tick.saturating_sub(last_alert) >= 30) {
+                            LAST_ALERT_TICK.store(tick.max(1), Ordering::Relaxed);
+                            let alert = aura_store::alerts::Alert::new(
+                                aura_core::AlertLevel::Critical,
+                                aura_store::alerts::AlertCategory::System,
+                                format!("data loss: {} events dropped since startup (+{} in last interval)",
+                                    total, total - prev),
+                            )
+                            .with_details(serde_json::json!({
+                                "bus_channel_full": bus_drops,
+                                "shared_buffer_full": buf_drops,
+                                "unknown_pv": snap.events_dropped_unknown_pv,
+                            }));
+                            let alert_pool = pool.clone();
+                            tokio::spawn(async move {
+                                let _ = aura_store::alerts::AlertDao::write(&alert_pool, &alert).await;
+                            });
+                        }
+                    }
                 }
 
                 // Re-tune chunk interval every 5 min from actual throughput
@@ -945,23 +992,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             _ = tokio::signal::ctrl_c() => { break; }
+            _ = sigterm.recv() => { shutdown_signal = "SIGTERM"; break; }
         }
     }
 
-    println!("\n{c_met}[shutdown]{c_rst} Signal SIGINT received.");
+    println!("\n{c_met}[shutdown]{c_rst} Signal {shutdown_signal} received — draining...");
 
-    // Close PVA sessions cleanly (TCP FIN, not RST) so IOCs don't log errors.
+    // Ordered shutdown — each stage stops feeding the next before the next
+    // one drains, so the final flush sees every event:
+    //
+    //   1) Close PVA sessions cleanly (TCP FIN, not RST) so IOCs don't log
+    //      errors. No new events enter the sockets.
+    //   2) Stop ingest threads. They check the flag at the top of their
+    //      loop, drain what's left in their sockets and push the final rows
+    //      into the SharedBuffers, then exit (joined here).
+    //   3) Only now cancel the store loop: its final drain + flush_all is
+    //      guaranteed to see ALL rows produced by ingest. Generous timeout:
+    //      the loop bounds its own shutdown flushes internally.
     driver.shutdown_sessions().await;
 
-    store_cancel_trigger.cancel();
-
-    drop(shard_senders);
     ingest_shutdown.store(true, Ordering::Relaxed);
-
-    let _ = tokio::time::timeout(Duration::from_secs(10), store_handle).await;
-
+    drop(shard_senders);
     for h in ingest_handles {
         let _ = h.join();
+    }
+
+    store_cancel_trigger.cancel();
+    if tokio::time::timeout(Duration::from_secs(60), store_handle)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "{c_met}[shutdown]{c_rst} store loop did not finish within 60s — \
+             remaining buffered rows may be lost (is PostgreSQL reachable?)"
+        );
     }
 
     discover_handle.abort();
