@@ -6,59 +6,94 @@ on:
   pull_request:
     branches: [ main, master ]
 
-# Security: Strict restriction of GITHUB_TOKEN permissions
-permissions:
-  contents: read
+# Default-deny global permissions
+permissions: { }
 
-# Performance: Cancel outdated runs on concurrent pushes
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   fmt:
-    name: Formatting (rustfmt)
+    name: Formatting
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4 # Automatically respects rust-toolchain.toml
-      - run: cargo fmt --all -- --check
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4 # pinned SHA
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
   clippy:
-    name: Linting (clippy)
+    name: Clippy
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4
-      - uses: Swatinem/rust-cache@f0deed1e0edfc266b02845248ab18388d32bf846 # v2.7.7
-      - run: cargo clippy --workspace --locked --all-targets --all-features
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4 # pinned SHA
+
+      - name: Lint
+        run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 
   test:
-    name: Tests & Verification
+    name: Tests
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4
-      - uses: Swatinem/rust-cache@f0deed1e0edfc266b02845248ab18388d32bf846 # v2.7.7
-      - run: cargo test --workspace --locked --all-targets --all-features
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4 # pinned SHA
+
+      - name: Test
+        run: cargo test --workspace --locked --all-targets --all-features
 
   docs:
-    name: Documentation Integrity
+    name: Documentation
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4
-      - uses: Swatinem/rust-cache@f0deed1e0edfc266b02845248ab18388d32bf846 # v2.7.7
-      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps --all-features
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-  security-and-licenses:
-    name: Security & License Audit
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e123566139a3f2d2f7881c00d41870198f3957f4 # pinned SHA
+
+      - name: Build documentation
+        run: cargo doc --workspace --locked --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  security:
+    name: Dependency & Supply Chain Audit
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: EmbarkStudios/cargo-deny-action@3f9a781a360ab24e930925769225726e63eb6653 # v2.0.10
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Cargo deny
+        uses: EmbarkStudios/cargo-deny-action@3f9a781a360ab24e930925769225726e63eb6653 # v2.0.10
         with:
           command: check advisories licenses sources
+
+      - name: Verify lockfile
+        run: cargo metadata --locked --format-version 1 --no-deps
