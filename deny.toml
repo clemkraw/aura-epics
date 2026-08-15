@@ -1,6 +1,6 @@
 [advisories]
 vulnerability = "deny"
-unmaintained = "warn"
+unmaintained = "workspace"
 notice = "warn"
 ignore = []
 
@@ -26,7 +26,7 @@ license-files = [
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"
+wildcards = "deny"
 highlight = "all"
 deny = []
 skip = []
