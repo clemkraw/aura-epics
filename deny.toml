@@ -1,15 +1,17 @@
 [advisories]
-vulnerabilities = "deny"
+version = 2
 unmaintained = "workspace"
 ignore = []
 
 [licenses]
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
+    "Unicode-3.0",
     "Unicode-DFS-2016",
 ]
 confidence-threshold = 0.8
@@ -18,7 +20,7 @@ confidence-threshold = 0.8
 crate = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [
-    { path = "LICENSE", hash = 0xbd0eed23 }
+    { path = "LICENSE", hash = 0xbd0eed23 },
 ]
 
 [bans]
