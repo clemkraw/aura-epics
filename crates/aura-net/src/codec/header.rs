@@ -99,8 +99,9 @@ impl fmt::Display for Segmentation {
 }
 
 /// Wire byte order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ByteOrder {
+    #[default]
     LittleEndian,
     BigEndian,
 }
@@ -200,12 +201,6 @@ impl ByteOrder {
             Self::LittleEndian => f64::from_le_bytes(bytes),
             Self::BigEndian => f64::from_be_bytes(bytes),
         }
-    }
-}
-
-impl Default for ByteOrder {
-    fn default() -> Self {
-        Self::LittleEndian
     }
 }
 

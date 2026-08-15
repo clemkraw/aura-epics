@@ -26,12 +26,11 @@
 //! = 2 + 12 + 8 + 12 + 8 + 12 + 6 + 6 = 66 bytes per element
 //! ```
 
+use super::copy_pool::{CopyPool, PG_EPOCH_OFFSET_US, PGCOPY_HEADER, PGCOPY_TRAILER, PushResult};
+use aura_core::error::{AuraError, AuraResult};
 use chrono::{DateTime, Utc};
 use std::fmt;
 use std::sync::atomic::{AtomicI64, Ordering};
-
-use super::copy_pool::{CopyPool, PG_EPOCH_OFFSET_US, PGCOPY_HEADER, PGCOPY_TRAILER, PushResult};
-use aura_core::error::{AuraError, AuraResult};
 
 const DEFAULT_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 const NUM_WIRE_SIZE: usize = 66;
@@ -241,11 +240,11 @@ impl ArrayWriter {
             ArrayData::String(v) => v.iter().map(|s| STR_WIRE_BASE + s.len()).sum(),
         };
 
-        if !self.num_buffer.is_empty() || !self.str_buffer.is_empty() {
-            if self.current_bytes + est_bytes > self.max_buffer_bytes {
-                self.total_backpressure += 1;
-                return PushResult::BackpressureExceeded;
-            }
+        if (!self.num_buffer.is_empty() || !self.str_buffer.is_empty())
+            && self.current_bytes + est_bytes > self.max_buffer_bytes
+        {
+            self.total_backpressure += 1;
+            return PushResult::BackpressureExceeded;
         }
 
         let aid = next_array_id();
@@ -310,7 +309,7 @@ impl ArrayWriter {
             let n_conn = pool.len();
 
             if num_count >= PARALLEL_THRESHOLD && n_conn > 1 {
-                let chunk_size = (num_count + n_conn - 1) / n_conn;
+                let chunk_size = num_count.div_ceil(n_conn);
                 let payloads: Vec<_> = self
                     .num_buffer
                     .chunks(chunk_size)

@@ -72,7 +72,9 @@ impl std::fmt::Display for Alarm {
 ///
 /// Ordered by increasing severity: None < Minor < Major < Invalid.
 /// `Undefined` is used for unknown/unmapped values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default,
+)]
 #[repr(i16)]
 pub enum AlarmSeverity {
     /// No alarm — value is within normal operating range.

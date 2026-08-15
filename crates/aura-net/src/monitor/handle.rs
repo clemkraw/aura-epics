@@ -74,7 +74,7 @@ impl MonitorHandle {
 
     /// Whether the subscription has been cancelled.
     pub fn is_cancelled(&self) -> bool {
-        self.cancel.as_ref().map_or(true, |c| c.is_cancelled())
+        self.cancel.as_ref().is_none_or(|c| c.is_cancelled())
     }
 
     /// The PV name this handle is monitoring.
@@ -175,7 +175,7 @@ mod tests {
     #[tokio::test]
     async fn test_recv() {
         let (tx, mut handle) = MonitorHandle::channel("PV:A", 16);
-        tx.send(scalar_event(3.14)).await.unwrap();
+        tx.send(scalar_event(3.96)).await.unwrap();
         let event = handle.recv().await.unwrap();
         assert!(event.is_value());
     }

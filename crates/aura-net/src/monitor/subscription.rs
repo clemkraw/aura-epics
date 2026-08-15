@@ -216,14 +216,14 @@ mod tests {
     #[test]
     fn event_scalar_delta() {
         let e = MonitorEvent::ScalarDelta {
-            value: 3.14,
+            value: 3.96,
             seconds: 0,
             nanos: 0,
             severity: 0,
             status: 0,
         };
         assert!(!e.is_value());
-        assert!(e.to_string().contains("3.14"));
+        assert!(e.to_string().contains("3.96"));
     }
 
     #[test]

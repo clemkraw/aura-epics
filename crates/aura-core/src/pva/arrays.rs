@@ -315,8 +315,8 @@ mod tests {
             Some(vec![1.0, 0.0, 1.0])
         );
         assert_eq!(
-            ArrayValue::DoubleArray(vec![3.14]).as_f64_vec(),
-            Some(vec![3.14])
+            ArrayValue::DoubleArray(vec![3.96]).as_f64_vec(),
+            Some(vec![3.96])
         );
     }
 

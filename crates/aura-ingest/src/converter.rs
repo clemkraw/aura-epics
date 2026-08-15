@@ -17,6 +17,7 @@ use aura_net::types::to_normative::to_normative_from_value;
 
 /// Result of converting a MonitorEvent.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConvertResult {
     /// Value update ready for storage.
     Update(PvUpdate),
@@ -74,7 +75,7 @@ impl PvConverter {
         if !self.metadata_extracted {
             self.metadata_extracted = true;
             let meta =
-                aura_core::metadata::PvMetadata::from_initial_update(&*self.pv_name, &update.data);
+                aura_core::metadata::PvMetadata::from_initial_update(&self.pv_name, &update.data);
             ConvertResult::UpdateWithMetadata(update, meta)
         } else {
             ConvertResult::Update(update)
@@ -82,7 +83,7 @@ impl PvConverter {
     }
 
     pub fn pv_name(&self) -> &str {
-        &*self.pv_name
+        &self.pv_name
     }
 
     /// Reset after IOC reconnect - re-capture metadata on next value in case the PV type or limits changed.

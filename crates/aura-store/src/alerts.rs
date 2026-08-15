@@ -326,7 +326,7 @@ impl AlertRow {
 /// Clamp limit to a safe range.
 #[inline]
 fn safe_limit(limit: i64) -> i64 {
-    limit.max(1).min(10_000)
+    limit.clamp(1, 10_000)
 }
 
 /// Alert log data access object.

@@ -81,60 +81,61 @@ pub fn to_normative_from_value(value: &PvaValue) -> Option<NormativeType> {
 }
 
 fn convert_nt_scalar(value: &PvaValue) -> Option<NormativeType> {
-    if let PvaValue::Structure(fields) = value {
-        if fields.len() >= 3 {
-            // Index 0: value (scalar)
-            let scalar_val = match &fields[0].1 {
-                PvaValue::Scalar(s) => s.clone(),
-                _ => return convert_nt_scalar_fallback(value),
-            };
+    if let PvaValue::Structure(fields) = value
+        && fields.len() >= 3
+    {
+        // Index 0: value (scalar)
+        let scalar_val = match &fields[0].1 {
+            PvaValue::Scalar(s) => s.clone(),
+            _ => return convert_nt_scalar_fallback(value),
+        };
 
-            // Index 1: alarm structure
-            let alarm = if let PvaValue::Structure(alarm_fields) = &fields[1].1 {
-                Alarm {
-                    severity: AlarmSeverity::from(
-                        alarm_fields
-                            .get(0)
-                            .and_then(|(_, v)| v.as_i32())
-                            .unwrap_or(0) as i16,
-                    ),
-                    status: AlarmStatus::from(
-                        alarm_fields
-                            .get(1)
-                            .and_then(|(_, v)| v.as_i32())
-                            .unwrap_or(0) as i16,
-                    ),
-                    message: alarm_fields
-                        .get(2)
-                        .and_then(|(_, v)| v.as_string())
-                        .unwrap_or("")
-                        .to_string(),
-                }
-            } else {
-                Alarm::default()
-            };
+        // Index 1: alarm structure
+        let alarm = if let PvaValue::Structure(alarm_fields) = &fields[1].1 {
+            Alarm {
+                severity: AlarmSeverity::from(
+                    alarm_fields
+                        .first()
+                        .and_then(|(_, v)| v.as_i32())
+                        .unwrap_or(0) as i16,
+                ),
+                status: AlarmStatus::from(
+                    alarm_fields
+                        .get(1)
+                        .and_then(|(_, v)| v.as_i32())
+                        .unwrap_or(0) as i16,
+                ),
+                message: alarm_fields
+                    .get(2)
+                    .and_then(|(_, v)| v.as_string())
+                    .unwrap_or("")
+                    .to_string(),
+            }
+        } else {
+            Alarm::default()
+        };
 
-            // Index 2: timeStamp structure
-            let timestamp = if let PvaValue::Structure(ts_fields) = &fields[2].1 {
-                TimeStamp {
-                    seconds: ts_fields.get(0).and_then(|(_, v)| v.as_i64()).unwrap_or(0),
-                    nanoseconds: ts_fields.get(1).and_then(|(_, v)| v.as_i32()).unwrap_or(0) as u32,
-                    user_tag: ts_fields.get(2).and_then(|(_, v)| v.as_i32()).unwrap_or(0),
-                }
-            } else {
-                TimeStamp::default()
-            };
+        // Index 2: timeStamp structure
+        let timestamp = if let PvaValue::Structure(ts_fields) = &fields[2].1 {
+            TimeStamp {
+                seconds: ts_fields.first().and_then(|(_, v)| v.as_i64()).unwrap_or(0),
+                nanoseconds: ts_fields.get(1).and_then(|(_, v)| v.as_i32()).unwrap_or(0) as u32,
+                user_tag: ts_fields.get(2).and_then(|(_, v)| v.as_i32()).unwrap_or(0),
+            }
+        } else {
+            TimeStamp::default()
+        };
 
-            return Some(NormativeType::NTScalar(NTScalar {
-                value: scalar_val,
-                alarm,
-                timestamp,
-                display: None,
-                control: None,
-                value_alarm: None,
-            }));
-        }
+        return Some(NormativeType::NTScalar(NTScalar {
+            value: scalar_val,
+            alarm,
+            timestamp,
+            display: None,
+            control: None,
+            value_alarm: None,
+        }));
     }
+
     convert_nt_scalar_fallback(value)
 }
 
@@ -217,9 +218,7 @@ fn convert_nt_ndarray(value: &PvaValue) -> Option<NormativeType> {
     let unique_id = value.field_i32("uniqueId").unwrap_or(0);
 
     // Data timestamp (separate from the main timestamp).
-    let data_timestamp = value
-        .field("dataTimeStamp")
-        .map(extract_timestamp_from);
+    let data_timestamp = value.field("dataTimeStamp").map(extract_timestamp_from);
 
     // Attributes: array of {name, value, source, sourceType}.
     let attribute = extract_nd_attributes(value.field("attribute"));
@@ -995,8 +994,8 @@ mod tests {
     #[test]
     fn test_json_scalar() {
         assert_eq!(
-            pva_value_to_json(&PvaValue::Scalar(sv(3.14))),
-            serde_json::json!(3.14)
+            pva_value_to_json(&PvaValue::Scalar(sv(3.96))),
+            serde_json::json!(3.96)
         );
     }
 

@@ -110,7 +110,7 @@ impl StoredMetadata {
             array_size: meta.array_size.map(|s| s as i32),
             description: meta.description.clone(),
             units: meta.units.clone(),
-            precision: meta.precision.max(0).min(15),
+            precision: meta.precision.clamp(0, 15),
             display_form: format!("{:?}", meta.display_form),
             display_low: meta.display_low,
             display_high: meta.display_high,

@@ -87,7 +87,7 @@ impl PvCache {
             self.misses += 1;
             // Saturation must be LOUD: past the cap, every event for an
             // uncached PV costs one SQL round-trip on the fallback path.
-            if self.saturations == 1 || self.saturations % 100_000 == 0 {
+            if self.saturations == 1 || self.saturations.is_multiple_of(100_000) {
                 tracing::warn!(
                     max_entries = self.max_entries,
                     saturations = self.saturations,

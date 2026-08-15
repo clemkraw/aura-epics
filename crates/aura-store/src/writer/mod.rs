@@ -185,7 +185,7 @@ impl BatchWriter {
         match self.dispatch_sync(update, reason) {
             Some(result) => result,
             None => {
-                let pv_id = self.pv_cache.resolve(&*update.pv_name, pool).await?;
+                let pv_id = self.pv_cache.resolve(&update.pv_name, pool).await?;
                 self.dispatch_with_id(update, pv_id, reason)
             }
         }
@@ -198,7 +198,7 @@ impl BatchWriter {
         update: &mut PvUpdate,
         reason: StoreReason,
     ) -> Option<AuraResult<bool>> {
-        let pv_id = self.pv_cache.resolve_cached(&*update.pv_name)?;
+        let pv_id = self.pv_cache.resolve_cached(&update.pv_name)?;
         Some(self.dispatch_with_id(update, pv_id, reason))
     }
 
@@ -523,6 +523,7 @@ impl FlushOutcome {
 /// `usize::MAX` to force the single-connection path). Returns
 /// `(rows_written, rows_to_retry)` and pushes failures into
 /// `errors` / `lost_rows`.
+#[allow(clippy::too_many_arguments)]
 async fn flush_section<T: Send>(
     pool: &copy_pool::CopyPool,
     sql: &'static str,
@@ -540,7 +541,7 @@ async fn flush_section<T: Send>(
     let n = pool.len();
 
     if count >= parallel_threshold && n > 1 {
-        let chunk_size = (count + n - 1) / n; // ≥ 1
+        let chunk_size = count.div_ceil(n); // >= 1
         let payloads: Vec<(Vec<u8>, usize)> = rows
             .chunks(chunk_size)
             .map(|chunk| (build(chunk), chunk.len()))
@@ -1126,10 +1127,10 @@ mod tests {
         assert_eq!(row.data.len(), 500);
         assert_eq!(row.dimensions, vec![320, 240]);
         // Original data moved out
-        if let NormativeType::NTNDArray(img) = &nt {
-            if let ArrayValue::UByteArray(v) = &img.value {
-                assert!(v.is_empty());
-            }
+        if let NormativeType::NTNDArray(img) = &nt
+            && let ArrayValue::UByteArray(v) = &img.value
+        {
+            assert!(v.is_empty());
         }
     }
 

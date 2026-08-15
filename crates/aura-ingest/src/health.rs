@@ -22,8 +22,8 @@ pub struct HealthState {
     started_at: Instant,
 }
 
-impl HealthState {
-    pub fn new() -> Self {
+impl Default for HealthState {
+    fn default() -> Self {
         Self {
             db_connected: AtomicBool::new(false),
             pva_connected: AtomicBool::new(false),
@@ -32,6 +32,12 @@ impl HealthState {
             active_sessions: AtomicU64::new(0),
             started_at: Instant::now(),
         }
+    }
+}
+
+impl HealthState {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn set_db_connected(&self, v: bool) {
