@@ -555,6 +555,7 @@ impl FastEnumLayout {
 }
 
 /// Runtime state for an active monitor (async - owns mpsc::Sender).
+#[allow(dead_code)]
 struct MonitorEntry {
     request_id: i32,
     subscription: MonitorSubscription,
@@ -573,6 +574,9 @@ struct MonitorEntry {
     fast_enum_layout: Option<FastEnumLayout>,
 }
 
+type MetadataBuffer = std::sync::Arc<std::sync::Mutex<Vec<(std::sync::Arc<str>, PvaValue)>>>;
+type PvCache = std::sync::Arc<arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>>;
+
 /// A PVA session on one TCP connection.
 ///
 /// Owns the TCP transport. Delegates channel/registry state to `ConnectionState` (from `client/connection.rs`).
@@ -585,9 +589,9 @@ pub struct PvaSession {
     /// Aggregated event bus - when set, events are pushed here instead of per-PV channels.
     bus_tx: Option<MonitorBusTx>,
     /// Shared buffer for metadata extraction (first full update per PV).
-    metadata_buf: Option<std::sync::Arc<std::sync::Mutex<Vec<(std::sync::Arc<str>, PvaValue)>>>>,
+    metadata_buf: Option<MetadataBuffer>,
     /// Shared pv_id cache for OPT-1: resolve pv_id once per monitor, not per event.
-    pv_cache: Option<std::sync::Arc<arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>>>,
+    pv_cache: Option<PvCache>,
 }
 
 impl PvaSession {
@@ -623,10 +627,7 @@ impl PvaSession {
     }
 
     /// Set the shared metadata buffer. First full update for each PV is pushed here.
-    pub fn set_metadata_buf(
-        &mut self,
-        buf: std::sync::Arc<std::sync::Mutex<Vec<(std::sync::Arc<str>, PvaValue)>>>,
-    ) {
+    pub fn set_metadata_buf(&mut self, buf: MetadataBuffer) {
         self.metadata_buf = Some(buf);
     }
 
@@ -945,7 +946,7 @@ impl PvaSession {
             sent += 1;
             // Flush every 10k to keep TCP buffer from growing unbounded.
             if sent.is_multiple_of(10_000) && self.tcp.flush_writes().await.is_err() {
-                for (_, pv) in &id_to_pv {
+                for pv in id_to_pv.values() {
                     results.push((
                         pv.to_string(),
                         Err(SessionError::Protocol("flush failed".into())),
@@ -954,8 +955,8 @@ impl PvaSession {
                 return results;
             }
         }
-        if let Err(_) = self.tcp.flush_writes().await {
-            for (_, pv) in &id_to_pv {
+        if self.tcp.flush_writes().await.is_err() {
+            for pv in id_to_pv.values() {
                 results.push((
                     pv.to_string(),
                     Err(SessionError::Protocol("flush failed".into())),
@@ -1050,7 +1051,7 @@ impl PvaSession {
                     tx,
                     pv_index: next_pv_index(),
                     bus_shard: self.bus_tx.as_ref().map_or(0, |b| {
-                        crate::monitor::bus::shard_for_pv(&**pv_name, b.n_shards())
+                        crate::monitor::bus::shard_for_pv(pv_name, b.n_shards())
                     }),
                     pv_id: 0,
                     fast_layout: None,
@@ -1077,7 +1078,7 @@ impl PvaSession {
                 self.tcp.buffer_msg(CMD_MONITOR, writer.as_bytes());
                 self.state.messages_sent += 1;
                 sent += 1;
-                if sent % 10_000 == 0 {
+                if sent.is_multiple_of(10_000) {
                     let _ = self.tcp.flush_writes().await;
                 }
             }
@@ -1107,18 +1108,16 @@ impl PvaSession {
                     if let Ok(hdr) = MonitorResponseHeader::decode(&mut reader) {
                         if hdr.sub_command == MonitorSubCommand::Init.to_u8() {
                             if let Ok(status) = PvaStatus::decode(&mut reader) {
-                                if status.is_ok() {
-                                    if let Ok(Some(desc)) =
+                                if status.is_ok()
+                                    && let Ok(Some(desc)) =
                                         FieldDesc::decode(&mut reader, &mut self.state.registry)
-                                    {
-                                        if let Some(mon) = self.monitors.get_mut(&hdr.request_id) {
-                                            mon.fast_layout = FastScalarLayout::detect(&desc);
-                                            mon.fast_array_layout = FastArrayLayout::detect(&desc);
-                                            mon.fast_enum_layout = FastEnumLayout::detect(&desc);
-                                            mon.subscription.set_type_desc(desc);
-                                            mon.subscription.activate();
-                                        }
-                                    }
+                                    && let Some(mon) = self.monitors.get_mut(&hdr.request_id)
+                                {
+                                    mon.fast_layout = FastScalarLayout::detect(&desc);
+                                    mon.fast_array_layout = FastArrayLayout::detect(&desc);
+                                    mon.fast_enum_layout = FastEnumLayout::detect(&desc);
+                                    mon.subscription.set_type_desc(desc);
+                                    mon.subscription.activate();
                                 }
                                 init_done.insert(hdr.request_id);
                                 got += 1;
@@ -1175,18 +1174,16 @@ impl PvaSession {
                     if let Ok(hdr) = MonitorResponseHeader::decode(&mut reader) {
                         if hdr.sub_command == MonitorSubCommand::Init.to_u8() {
                             if let Ok(status) = PvaStatus::decode(&mut reader) {
-                                if status.is_ok() {
-                                    if let Ok(Some(desc)) =
+                                if status.is_ok()
+                                    && let Ok(Some(desc)) =
                                         FieldDesc::decode(&mut reader, &mut self.state.registry)
-                                    {
-                                        if let Some(mon) = self.monitors.get_mut(&hdr.request_id) {
-                                            mon.fast_layout = FastScalarLayout::detect(&desc);
-                                            mon.fast_array_layout = FastArrayLayout::detect(&desc);
-                                            mon.fast_enum_layout = FastEnumLayout::detect(&desc);
-                                            mon.subscription.set_type_desc(desc);
-                                            mon.subscription.activate();
-                                        }
-                                    }
+                                    && let Some(mon) = self.monitors.get_mut(&hdr.request_id)
+                                {
+                                    mon.fast_layout = FastScalarLayout::detect(&desc);
+                                    mon.fast_array_layout = FastArrayLayout::detect(&desc);
+                                    mon.fast_enum_layout = FastEnumLayout::detect(&desc);
+                                    mon.subscription.set_type_desc(desc);
+                                    mon.subscription.activate();
                                 }
                                 init_done.insert(hdr.request_id);
                                 retry_got += 1;
@@ -1217,7 +1214,7 @@ impl PvaSession {
                 self.tcp.buffer_msg(CMD_MONITOR, writer.as_bytes());
                 self.state.messages_sent += 1;
                 start_count += 1;
-                if start_count % 10_000 == 0 {
+                if start_count.is_multiple_of(10_000) {
                     let _ = self.tcp.flush_writes().await;
                 }
             }
@@ -1371,13 +1368,13 @@ impl PvaSession {
                     if fast_ok.is_ok() {
                         mon.subscription.updates_received += 1;
                         // Lazy-resolve pv_id (once per monitor, not per event).
-                        if mon.pv_id == 0 {
-                            if let Some(ref pc) = self.pv_cache {
-                                if let Some(&id) = pc.load().get(&*mon.subscription.pv_name) {
-                                    mon.pv_id = id;
-                                }
-                            }
+                        if mon.pv_id == 0
+                            && let Some(ref pc) = self.pv_cache
+                            && let Some(&id) = pc.load().get(&*mon.subscription.pv_name)
+                        {
+                            mon.pv_id = id;
                         }
+
                         let event = if let Some(sv) = string_value {
                             MonitorEvent::StringDelta {
                                 value: sv,
@@ -1448,12 +1445,11 @@ impl PvaSession {
 
                     if fast_ok.is_ok() && !values.is_empty() {
                         mon.subscription.updates_received += 1;
-                        if mon.pv_id == 0 {
-                            if let Some(ref pc) = self.pv_cache {
-                                if let Some(&id) = pc.load().get(&*mon.subscription.pv_name) {
-                                    mon.pv_id = id;
-                                }
-                            }
+                        if mon.pv_id == 0
+                            && let Some(ref pc) = self.pv_cache
+                            && let Some(&id) = pc.load().get(&*mon.subscription.pv_name)
+                        {
+                            mon.pv_id = id;
                         }
                         let event = MonitorEvent::ArrayDelta {
                             values,
@@ -1522,12 +1518,11 @@ impl PvaSession {
 
                     if fast_ok.is_ok() {
                         mon.subscription.updates_received += 1;
-                        if mon.pv_id == 0 {
-                            if let Some(ref pc) = self.pv_cache {
-                                if let Some(&id) = pc.load().get(&*mon.subscription.pv_name) {
-                                    mon.pv_id = id;
-                                }
-                            }
+                        if mon.pv_id == 0
+                            && let Some(ref pc) = self.pv_cache
+                            && let Some(&id) = pc.load().get(&*mon.subscription.pv_name)
+                        {
+                            mon.pv_id = id;
                         }
                         // Emit ScalarDelta — NTEnum index stored as f64 in samples table.
                         let event = MonitorEvent::ScalarDelta {
@@ -1596,24 +1591,24 @@ impl PvaSession {
             mon.subscription.last_value = Some(value.clone());
         }
         // Push metadata on the FIRST update for this monitor regardless of bitset.
-        if mon.subscription.updates_received == 0 {
-            if let Some(ref buf) = self.metadata_buf {
-                if let Ok(mut v) = buf.lock() {
-                    let pv = std::sync::Arc::clone(&mon.subscription.pv_name);
-                    tracing::debug!(pv = %pv, is_full = is_full_update, buf_len = v.len(), "metadata push");
-                    v.push((pv, value.clone()));
-                }
-            }
+        if mon.subscription.updates_received == 0
+            && let Some(ref buf) = self.metadata_buf
+            && let Ok(mut v) = buf.lock()
+        {
+            let pv = std::sync::Arc::clone(&mon.subscription.pv_name);
+            tracing::debug!(pv = %pv, is_full = is_full_update, buf_len = v.len(), "metadata push");
+            v.push((pv, value.clone()));
         }
+
         mon.subscription.updates_received += 1;
 
         // Send the value - use aggregated bus if available, else per-PV channel.
-        if mon.pv_id == 0 {
-            if let Some(ref pc) = self.pv_cache {
-                if let Some(&id) = pc.load().get(&*mon.subscription.pv_name) {
-                    mon.pv_id = id;
-                }
-            }
+        // Send the value - use aggregated bus if available, else per-PV channel.
+        if mon.pv_id == 0
+            && let Some(ref pc) = self.pv_cache
+            && let Some(&id) = pc.load().get(&*mon.subscription.pv_name)
+        {
+            mon.pv_id = id;
         }
         let event = MonitorEvent::Value(value);
         if let Some(ref bus) = self.bus_tx {
@@ -1726,10 +1721,8 @@ impl PvaSession {
             self.state.messages_sent += 1;
             batches_sent += 1;
 
-            if batches_sent % 100 == 0 {
-                if self.tcp.flush_writes().await.is_err() {
-                    return found;
-                }
+            if batches_sent.is_multiple_of(100) && self.tcp.flush_writes().await.is_err() {
+                return found;
             }
         }
         if self.tcp.flush_writes().await.is_err() {
@@ -1738,7 +1731,7 @@ impl PvaSession {
 
         // Read search responses with timeout.
         // Each response contains the IDs of PVs that this IOC hosts.
-        let expected_responses = (pv_names.len() + batch_size - 1) / batch_size;
+        let expected_responses = pv_names.len().div_ceil(batch_size);
         let timeout_secs = 10 + (pv_names.len() as u64 / 10_000).max(1);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let mut responses_received = 0usize;

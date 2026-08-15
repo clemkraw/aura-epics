@@ -1,6 +1,6 @@
 //! Tokio codec for PVA TCP stream framing.
 
-use super::header::{ByteOrder, HEADER_SIZE, MAX_PAYLOAD_SIZE, PVA_MAGIC, PvaHeader, Segmentation};
+use super::header::{ByteOrder, HEADER_SIZE, MAX_PAYLOAD_SIZE, PvaHeader, Segmentation};
 use bytes::{Buf, BytesMut};
 use std::fmt;
 
@@ -234,6 +234,7 @@ impl std::error::Error for CodecError {}
 #[cfg(test)]
 mod tests {
     use super::super::commands::*;
+    use super::super::header::PVA_MAGIC;
     use super::*;
 
     fn mk(header: PvaHeader, payload: &[u8]) -> BytesMut {

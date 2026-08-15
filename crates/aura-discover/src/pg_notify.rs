@@ -36,11 +36,11 @@ pub fn spawn_listener(db_url: String) -> tokio::sync::mpsc::Receiver<String> {
                         ),
                         _ => None,
                     };
-                    if let Some(json) = cmd_json {
-                        if tx.send(json).await.is_err() {
-                            tracing::warn!("pg_notify channel closed — exiting listener");
-                            return;
-                        }
+                    if let Some(json) = cmd_json
+                        && tx.send(json).await.is_err()
+                    {
+                        tracing::warn!("pg_notify channel closed — exiting listener");
+                        return;
                     }
                 }
                 Err(e) => {

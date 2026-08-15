@@ -53,7 +53,7 @@ impl IngestMetrics {
             events_skipped: self.events_skipped.load(Relaxed),
             fast_path: fp,
             slow_path: sp,
-            fast_path_pct: if fp + sp > 0 { fp * 100 / (fp + sp) } else { 0 },
+            fast_path_pct: (fp * 100).checked_div(fp + sp).unwrap_or(0),
             events_dropped_unknown_pv: self.events_dropped_unknown_pv.load(Relaxed),
             disconnects: self.disconnects.load(Relaxed),
             reconnects: self.reconnects.load(Relaxed),

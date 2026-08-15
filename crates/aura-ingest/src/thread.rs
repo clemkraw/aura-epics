@@ -8,14 +8,18 @@ use aura_core::config::AuraConfig;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic::Ordering};
 
+type PvStatsMap = HashMap<i32, (u64, f64, i16)>;
+type PvStatsSink = Arc<Mutex<Vec<PvStatsMap>>>;
+
 /// Run one ingest shard: drain events from bus, decode, push to SharedBuffer.
+#[allow(clippy::too_many_arguments)]
 pub fn run_ingest_shard(
     pv_names: Vec<String>,
     mut shard_rx: aura_net::monitor::bus::MonitorBusRx,
     shared_buf: Arc<aura_store::writer::shared_buf::SharedBuffer>,
     pv_cache: Arc<arc_swap::ArcSwap<HashMap<Arc<str>, i32>>>,
     meta_store: Arc<Mutex<Vec<aura_core::metadata::PvMetadata>>>,
-    stats_sink: Arc<Mutex<Vec<HashMap<i32, (u64, f64, i16)>>>>,
+    stats_sink: PvStatsSink,
     metrics: Arc<IngestMetrics>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     heartbeat_config: Arc<arc_swap::ArcSwap<Vec<(i32, f32)>>>,
@@ -334,10 +338,10 @@ pub fn run_ingest_shard(
         engine.total_published = 0;
         engine.total_skipped = 0;
 
-        if !engine.pending_metadata.is_empty() {
-            if let Ok(mut store) = meta_store.lock() {
-                store.append(&mut engine.pending_metadata);
-            }
+        if !engine.pending_metadata.is_empty()
+            && let Ok(mut store) = meta_store.lock()
+        {
+            store.append(&mut engine.pending_metadata);
         }
 
         if last_stats_flush.elapsed() > std::time::Duration::from_secs(30) {
@@ -399,7 +403,7 @@ pub struct IngestContext {
     pub shared_bufs: Vec<Arc<aura_store::writer::shared_buf::SharedBuffer>>,
     pub shared_pv_cache: Arc<arc_swap::ArcSwap<HashMap<Arc<str>, i32>>>,
     pub inline_meta_store: Arc<Mutex<Vec<aura_core::metadata::PvMetadata>>>,
-    pub pv_stats_sink: Arc<Mutex<Vec<HashMap<i32, (u64, f64, i16)>>>>,
+    pub pv_stats_sink: PvStatsSink,
     pub metrics: Arc<IngestMetrics>,
     pub shutdown: Arc<std::sync::atomic::AtomicBool>,
     pub heartbeat_config: Arc<arc_swap::ArcSwap<Vec<(i32, f32)>>>,

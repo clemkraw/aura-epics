@@ -1,6 +1,6 @@
 //! Shared writer buffer — per-thread, with dedicated scalar queue.
 //!
-//! Scalars (99% of traffic) go into a dedicated Vec<ScalarRow> (32 bytes/row).
+//! Scalars (99% of traffic) go into a dedicated `Vec<ScalarRow>` (32 bytes/row).
 //! parking_lot::Mutex (8ns uncontended vs 25ns std::sync::Mutex).
 
 use parking_lot::Mutex;

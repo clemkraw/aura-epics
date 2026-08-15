@@ -349,27 +349,33 @@ mod tests {
 
     #[test]
     fn test_display_valid_range() {
-        let mut d = Display::default();
-        d.limit_low = 0.0;
-        d.limit_high = 100.0;
+        let d = Display {
+            limit_low: 0.0,
+            limit_high: 100.0,
+            ..Default::default()
+        };
         assert!(d.has_valid_range());
         assert_eq!(d.range(), 100.0);
     }
 
     #[test]
     fn test_display_invalid_range_equal() {
-        let mut d = Display::default();
-        d.limit_low = 5.0;
-        d.limit_high = 5.0;
+        let d = Display {
+            limit_low: 5.0,
+            limit_high: 5.0,
+            ..Default::default()
+        };
         assert!(!d.has_valid_range());
         assert_eq!(d.range(), 0.0);
     }
 
     #[test]
     fn test_display_invalid_range_inverted() {
-        let mut d = Display::default();
-        d.limit_low = 100.0;
-        d.limit_high = 0.0;
+        let d = Display {
+            limit_low: 100.0,
+            limit_high: 0.0,
+            ..Default::default()
+        };
         assert!(!d.has_valid_range());
         assert_eq!(d.range(), 0.0);
     }

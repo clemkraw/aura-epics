@@ -135,29 +135,29 @@ pub async fn run(
         }
 
         // 2. Schedule next flush: prioritized pending retries over fresh data.
-        if bg_flush.is_none() {
-            if let Some(pr) = pending_retry.take() {
-                if std::time::Instant::now() >= pr.next_try {
-                    // Attempt to re-establish dropped pool connections prior to retry
-                    let (healed, still_dead) = pipeline.heal_copy_connections().await;
-                    if healed > 0 {
-                        tracing::info!(
-                            healed,
-                            still_dead,
-                            "COPY connections re-established before retry"
-                        );
-                    }
-                    inflight_attempts = pr.attempts;
-                    inflight_rows = pr.bundle.total_rows();
-                    inflight_progress = Arc::new(AtomicU64::new(0));
-                    bg_flush = Some(tokio::spawn(
-                        pr.bundle
-                            .flush_with_progress(Arc::clone(&inflight_progress)),
-                    ));
-                    did_flush_work = true;
-                } else {
-                    pending_retry = Some(pr); // Delay not elapsed
+        if bg_flush.is_none()
+            && let Some(pr) = pending_retry.take()
+        {
+            if std::time::Instant::now() >= pr.next_try {
+                // Attempt to re-establish dropped pool connections prior to retry
+                let (healed, still_dead) = pipeline.heal_copy_connections().await;
+                if healed > 0 {
+                    tracing::info!(
+                        healed,
+                        still_dead,
+                        "COPY connections re-established before retry"
+                    );
                 }
+                inflight_attempts = pr.attempts;
+                inflight_rows = pr.bundle.total_rows();
+                inflight_progress = Arc::new(AtomicU64::new(0));
+                bg_flush = Some(tokio::spawn(
+                    pr.bundle
+                        .flush_with_progress(Arc::clone(&inflight_progress)),
+                ));
+                did_flush_work = true;
+            } else {
+                pending_retry = Some(pr); // Delay not elapsed
             }
         }
 
@@ -208,34 +208,29 @@ pub async fn run(
         // Drain fallback channel
         let mut n_fallback = 0usize;
         if pending_retry.is_none() {
-            loop {
-                match rx.try_recv() {
-                    Ok(mut update) => {
-                        match pipeline.writer_mut().dispatch_sync(
-                            &mut update,
-                            aura_core::sample::StoreReason::ValueChanged,
-                        ) {
-                            Some(Ok(_)) => {}
-                            Some(Err(e)) => {
-                                tracing::error!("dispatch error: {e}");
-                            }
-                            None => {
-                                let _ = pipeline
-                                    .writer_mut()
-                                    .dispatch(
-                                        &mut update,
-                                        aura_core::sample::StoreReason::ValueChanged,
-                                        &store_pool,
-                                    )
-                                    .await;
-                            }
-                        }
-                        n_fallback += 1;
-                        if n_fallback >= 10_000 {
-                            break;
-                        }
+            while let Ok(mut update) = rx.try_recv() {
+                match pipeline
+                    .writer_mut()
+                    .dispatch_sync(&mut update, aura_core::sample::StoreReason::ValueChanged)
+                {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        tracing::error!("dispatch error: {e}");
                     }
-                    Err(_) => break,
+                    None => {
+                        let _ = pipeline
+                            .writer_mut()
+                            .dispatch(
+                                &mut update,
+                                aura_core::sample::StoreReason::ValueChanged,
+                                &store_pool,
+                            )
+                            .await;
+                    }
+                }
+                n_fallback += 1;
+                if n_fallback >= 10_000 {
+                    break;
                 }
             }
         }

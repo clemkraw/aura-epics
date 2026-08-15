@@ -205,7 +205,7 @@ impl PvaValue {
             _ => 0,
         }
     }
-    pub fn is_empty_value(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0 && !self.is_scalar() && !self.is_null()
     }
 }
@@ -336,25 +336,15 @@ mod tests {
     }
     #[test]
     fn test_dec_float() {
-        assert!(
-            (decode_scalar(
-                &mut le_r(
-                    &{
-                        let mut w = le_w();
-                        w.write_f32(3.14);
-                        w
-                    }
-                    .as_bytes()
-                ),
-                ScalarType::Float
-            )
+        let mut w = le_w();
+        w.write_f32(3.96);
+
+        let decoded = decode_scalar(&mut le_r(w.as_bytes()), ScalarType::Float)
             .unwrap()
             .as_f64()
-            .unwrap()
-                - 3.14)
-                .abs()
-                < 0.01
-        );
+            .unwrap();
+
+        assert!((decoded - 3.96).abs() < 0.01);
     }
     #[test]
     fn test_dec_double() {
@@ -400,13 +390,13 @@ mod tests {
     #[test]
     fn test_dec_double_be() {
         let mut w = be_w();
-        w.write_f64(2.718);
+        w.write_f64(2.969);
         assert!(
             (decode_scalar(&mut be_r(w.as_bytes()), ScalarType::Double)
                 .unwrap()
                 .as_f64()
                 .unwrap()
-                - 2.718)
+                - 2.969)
                 .abs()
                 < 1e-10
         );
@@ -423,7 +413,7 @@ mod tests {
     #[test]
     fn test_vdec_scalar() {
         let mut w = le_w();
-        w.write_f64(2.718);
+        w.write_f64(2.969);
         assert!(
             (PvaValue::decode_from(
                 &mut le_r(w.as_bytes()),
@@ -432,7 +422,7 @@ mod tests {
             .unwrap()
             .as_f64()
             .unwrap()
-                - 2.718)
+                - 2.969)
                 .abs()
                 < 1e-10
         );
@@ -558,11 +548,11 @@ mod tests {
         );
         let mut w = le_w();
         w.write_i32(1);
-        w.write_f64(3.14);
+        w.write_f64(3.19);
         match PvaValue::decode_from(&mut le_r(w.as_bytes()), &d).unwrap() {
             PvaValue::Union(n, v) => {
                 assert_eq!(n, Arc::from("b"));
-                assert!((v.as_f64().unwrap() - 3.14).abs() < 1e-10);
+                assert!((v.as_f64().unwrap() - 3.19).abs() < 1e-10);
             }
             _ => panic!(),
         }
@@ -600,8 +590,8 @@ mod tests {
     #[test]
     fn test_as_f64() {
         assert_eq!(
-            PvaValue::Scalar(ScalarValue::Double(3.14)).as_f64(),
-            Some(3.14)
+            PvaValue::Scalar(ScalarValue::Double(3.19)).as_f64(),
+            Some(3.19)
         );
     }
     #[test]
@@ -703,8 +693,8 @@ mod tests {
     }
     #[test]
     fn test_empty_val() {
-        assert!(PvaValue::Structure(vec![]).is_empty_value());
-        assert!(!PvaValue::Null.is_empty_value());
+        assert!(PvaValue::Structure(vec![]).is_empty());
+        assert!(!PvaValue::Null.is_empty());
     }
 
     #[test]
@@ -720,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_alias() {
-        let v: PvaScalar = PvaScalar::Double(3.14);
-        assert_eq!(v.as_f64(), Some(3.14));
+        let v: PvaScalar = PvaScalar::Double(3.19);
+        assert_eq!(v.as_f64(), Some(3.19));
     }
 }

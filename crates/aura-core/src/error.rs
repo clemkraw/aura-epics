@@ -105,6 +105,44 @@ impl AuraError {
     }
 }
 
+impl PartialEq for AuraError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Io(_), Self::Io(_)) => self.to_string() == other.to_string(),
+            (Self::Redis(a), Self::Redis(b)) => a == b,
+            (Self::Database(a), Self::Database(b)) => a == b,
+            (Self::Pva(a), Self::Pva(b)) => a == b,
+            (Self::Config(a), Self::Config(b)) => a == b,
+            (Self::Serialization(a), Self::Serialization(b)) => a == b,
+            (
+                Self::Pv {
+                    pv_name: p1,
+                    detail: d1,
+                },
+                Self::Pv {
+                    pv_name: p2,
+                    detail: d2,
+                },
+            ) => p1 == p2 && d1 == d2,
+            (
+                Self::ServiceUnavailable {
+                    service: s1,
+                    reason: r1,
+                },
+                Self::ServiceUnavailable {
+                    service: s2,
+                    reason: r2,
+                },
+            ) => s1 == s2 && r1 == r2,
+            (Self::Timeout(a), Self::Timeout(b)) => a == b,
+            (Self::Internal(a), Self::Internal(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for AuraError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,14 +274,15 @@ mod tests {
     #[test]
     fn test_result_ok() {
         let r: AuraResult<i32> = Ok(42);
-        assert_eq!(r.unwrap(), 42);
+        assert_eq!(r, Ok(42));
     }
-
     #[test]
     fn test_result_err() {
         let r: AuraResult<()> = Err(AuraError::internal("fail"));
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("fail"));
+        let Err(e) = r else {
+            panic!("expected err");
+        };
+        assert!(e.to_string().contains("fail"));
     }
 
     // ── Debug trait ──────────────────────────────────────────────────

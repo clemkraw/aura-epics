@@ -273,7 +273,7 @@ impl ScalarWriter {
         const PARALLEL_THRESHOLD: usize = 10_000;
 
         if count >= PARALLEL_THRESHOLD && n > 1 {
-            let chunk_size = (count + n - 1) / n;
+            let chunk_size = count.div_ceil(n);
 
             let t0 = std::time::Instant::now();
             let payloads: Vec<_> = self
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn row_mem_size() {
         assert_eq!(ScalarRow::mem_size(), ROW_MEM_SIZE);
-        assert!(ROW_MEM_SIZE >= 26);
+        const { assert!(ROW_MEM_SIZE >= 26) };
     }
 
     #[test]
@@ -732,7 +732,7 @@ mod tests {
 
     #[test]
     fn encode_copy_deterministic() {
-        let r = row_full(ts(1700000000, 0), 42, 3.14, 2, 1, StoreReason::Heartbeat);
+        let r = row_full(ts(1700000000, 0), 42, 3.96, 2, 1, StoreReason::Heartbeat);
         let mut a = [0u8; WIRE_ROW_SIZE];
         let mut b = [0u8; WIRE_ROW_SIZE];
         r.encode_copy(&mut a);

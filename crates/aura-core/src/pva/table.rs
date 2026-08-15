@@ -62,7 +62,7 @@ impl fmt::Display for TableColumn {
 /// Histogram bin counts — frequency data for NTHistogram.
 ///
 /// The PVAccess spec allows short[], int[], or long[] for bin counts.
-/// AURA normalizes to i64 via [`as_i64_vec`] for uniform processing.
+/// AURA normalizes to i64 via [`Self::as_i64_vec`] for uniform processing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "v")]
 pub enum HistogramValue {

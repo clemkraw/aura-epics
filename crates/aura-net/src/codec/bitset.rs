@@ -46,7 +46,7 @@ impl PvaBitSet {
         let mut bs = Self::new();
         bs.bit_count = n;
         if n > INLINE_BITS {
-            let extra = (n - INLINE_BITS + 63) / 64;
+            let extra = (n - INLINE_BITS).div_ceil(64);
             bs.overflow = vec![0u64; extra];
         }
         bs

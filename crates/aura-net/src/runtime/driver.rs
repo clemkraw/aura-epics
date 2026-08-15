@@ -74,6 +74,11 @@ pub enum LifecycleEvent {
     },
 }
 
+type MetadataBuf =
+    std::sync::Arc<std::sync::Mutex<Vec<(std::sync::Arc<str>, crate::types::pva_value::PvaValue)>>>;
+
+type PvCache = std::sync::Arc<arc_swap::ArcSwap<HashMap<std::sync::Arc<str>, i32>>>;
+
 pub struct PvaDriver {
     config: PvaClientConfig,
     name_servers: Vec<SocketAddr>,
@@ -89,12 +94,8 @@ pub struct PvaDriver {
     /// CancellationToken per IOC - cancel to stop event loop + reconnect.
     cancel_tokens: HashMap<SocketAddr, tokio_util::sync::CancellationToken>,
     /// Shared metadata buffer - sessions push first full update here. Main.rs drains.
-    metadata_buf: std::sync::Arc<
-        std::sync::Mutex<Vec<(std::sync::Arc<str>, crate::types::pva_value::PvaValue)>>,
-    >,
-    pv_cache: Option<
-        std::sync::Arc<arc_swap::ArcSwap<std::collections::HashMap<std::sync::Arc<str>, i32>>>,
-    >,
+    metadata_buf: MetadataBuf,
+    pv_cache: Option<PvCache>,
     /// Reconnect notification - event loop sends (addr, new_cmd_tx) on successful reconnect.
     reconnect_tx:
         tokio::sync::mpsc::Sender<(SocketAddr, tokio::sync::mpsc::Sender<SessionCommand>)>,
@@ -122,9 +123,9 @@ impl PvaDriver {
             cancel_tokens: HashMap::new(),
             metadata_buf: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             pv_cache: None,
-            reconnect_tx: reconnect_tx,
+            reconnect_tx,
             reconnect_rx: Some(reconnect_rx),
-            lifecycle_tx: lifecycle_tx,
+            lifecycle_tx,
             lifecycle_rx: Some(lifecycle_rx),
         }
     }
@@ -352,16 +353,7 @@ impl PvaDriver {
         }
 
         // New IOCs: create fresh TCP sessions.
-        let mut subscribe_handles: Vec<
-            tokio::task::JoinHandle<
-                Option<(
-                    SocketAddr,
-                    PvaSession,
-                    Vec<String>,
-                    Vec<(String, Result<MonitorHandle, DriverError>)>,
-                )>,
-            >,
-        > = Vec::new();
+        let mut subscribe_handles = Vec::new();
 
         for (addr, pvs) in new_ioc_pvs {
             let bus = bus_tx_clone.clone();

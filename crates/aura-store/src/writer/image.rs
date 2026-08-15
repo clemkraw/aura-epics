@@ -37,6 +37,7 @@ pub struct ImageRow {
     pub status: i16,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl ImageRow {
     pub fn new(
         time: DateTime<Utc>,

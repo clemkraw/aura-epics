@@ -15,6 +15,7 @@ use crate::converter::{ConvertResult, PvConverter};
 use aura_core::sample::PvUpdate;
 
 /// Result of processing a single MonitorEvent.
+#[allow(clippy::large_enum_variant)]
 pub enum ProcessResult {
     /// A sample was produced - send it to the caller.
     Sample(PvUpdate),
@@ -23,6 +24,7 @@ pub enum ProcessResult {
 }
 
 /// Ingest engine - manages per-PV converters and metadata extraction.
+#[derive(Default)]
 pub struct IngestEngine {
     pub converters: HashMap<Arc<str>, PvConverter>,
     /// Metadata extracted from first updates, pending DB write.

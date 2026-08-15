@@ -5,7 +5,7 @@
 //!
 //! # Write Strategy
 //!
-//! Binary COPY via the shared [`CopyPool`](CopyPool).
+//! Binary COPY via the shared [`CopyPool`].
 //! Variable-length TEXT values are encoded as `len(4) + utf8_bytes`.
 //! No text escaping needed - binary format handles all byte values.
 //!
@@ -139,7 +139,7 @@ impl fmt::Display for StringRow {
 /// High-throughput batch writer for string samples.
 ///
 /// Uses binary COPY via the shared [`CopyPool`]. For workloads above
-/// [`PARALLEL_THRESHOLD`], splits across multiple pool connections.
+/// `PARALLEL_THRESHOLD`, splits across multiple pool connections.
 pub struct StringWriter {
     batch_size: usize,
     max_buffer_bytes: usize,
@@ -220,7 +220,7 @@ impl StringWriter {
         let t0 = std::time::Instant::now();
 
         if count >= PARALLEL_THRESHOLD && n_conn > 1 {
-            let chunk_size = (count + n_conn - 1) / n_conn;
+            let chunk_size = count.div_ceil(n_conn);
             let payloads: Vec<_> = self
                 .buffer
                 .chunks(chunk_size)

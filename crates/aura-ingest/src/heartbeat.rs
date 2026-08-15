@@ -209,14 +209,14 @@ mod tests {
     fn disabled_does_nothing() {
         let mut t = HeartbeatTracker::new(0.0, empty_config());
         assert!(t.is_disabled());
-        t.record_store(1, 3.14, 0, 0, Instant::now());
+        t.record_store(1, 3.96, 0, 0, Instant::now());
         assert_eq!(t.emit_heartbeats(&make_buf(), &active(&[])), 0);
     }
 
     #[test]
     fn no_heartbeat_when_fresh() {
         let mut t = HeartbeatTracker::new(60.0, empty_config());
-        t.record_store(1, 3.14, 0, 0, Instant::now());
+        t.record_store(1, 3.96, 0, 0, Instant::now());
         assert_eq!(t.emit_heartbeats(&make_buf(), &active(&[1])), 0);
     }
 

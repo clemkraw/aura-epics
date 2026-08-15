@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_sort() {
-        let mut timestamps = vec![
+        let mut timestamps = [
             TimeStamp::new(3, 0),
             TimeStamp::new(1, 0),
             TimeStamp::new(2, 500),

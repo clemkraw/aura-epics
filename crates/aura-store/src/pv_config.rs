@@ -122,7 +122,7 @@ impl PvConfigDao {
         let like_pattern = format!("%{pattern}%");
         let rows = sqlx::query_as::<_, PvConfigRow>(sql::SEARCH)
             .bind(&like_pattern)
-            .bind(limit.max(1).min(1000))
+            .bind(limit.clamp(1, 1000))
             .fetch_all(pool)
             .await
             .map_err(|e| AuraError::database(format!("search: {e}")))?;
@@ -248,6 +248,7 @@ impl PvConfigDao {
 }
 
 /// Internal sqlx row — moves into PvConfig (zero clone).
+#[allow(dead_code)]
 #[derive(Debug, sqlx::FromRow)]
 struct PvConfigRow {
     pv_name: String,

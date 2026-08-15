@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let num_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let ingest_threads = (num_cores / 4).max(2).min(16); // 16 logical CPUs -> 4 ingest threads
+    let ingest_threads = (num_cores / 4).clamp(2, 16); // 16 logical CPUs -> 4 ingest threads
 
     // Dynamic buffer sizing: 2% of system RAM (/50), clamped to 2M..20M rows total.
     let total_ram_mb = {
@@ -152,8 +152,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         (info.total / 1024) as usize // KB → MB
     };
     let buf_total = (total_ram_mb * 1024 * 1024 / 50 / 32) // 2% of RAM / 32 bytes/row
-        .max(2_000_000)
-        .min(20_000_000);
+        .clamp(2_000_000, 20_000_000);
     let buf_initial = (buf_total / 4).max(100_000);
     println!(
         "{c_met}[{}]{c_rst} {c_ok}sto  RAM: {} MB — buffer: {}M rows ({} MB per shard × {} shards){c_rst}",
@@ -163,7 +162,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         buf_total / ingest_threads * 32 / 1024 / 1024,
         ingest_threads
     );
-    let copy_connections = (num_cores / 2).max(4).min(16);
+    let copy_connections = (num_cores / 2).clamp(4, 16);
 
     println!(
         "{c_met}[{}]{c_rst} {c_id}sto{c_rst}  Detected {c_val}{num_cores}{c_rst} logical CPUs              - {c_val}{ingest_threads}{c_rst} ingest threads,              {c_val}{copy_connections}{c_rst} COPY connections",
@@ -212,7 +211,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
         .collect();
     let shared_writer_bufs_store: Vec<Arc<aura_store::writer::shared_buf::SharedBuffer>> =
-        shared_writer_bufs.iter().map(|b| Arc::clone(b)).collect();
+        shared_writer_bufs.iter().map(Arc::clone).collect();
     // Single reference for handlers (disconnect/reconnect/timeout samples — rare events).
     let shared_writer_buf = Arc::clone(&shared_writer_bufs[0]);
 
@@ -477,7 +476,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     {
         let n_pvs = shared_pv_cache.load().len().max(1);
         let est_rate = n_pvs * 10;
-        let secs = (chunk_max_rows / est_rate).max(60).min(86400) as u64;
+        let secs = (chunk_max_rows / est_rate).clamp(60, 86400) as u64;
         let interval = format_chunk_interval(secs);
         if let Err(e) = sqlx::query("SELECT set_chunk_time_interval('samples', $1::interval)")
             .bind(&interval)
@@ -493,8 +492,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let pv_stats_sink: Arc<std::sync::Mutex<Vec<std::collections::HashMap<i32, (u64, f64, i16)>>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    type PvStatsSink = std::sync::Mutex<Vec<std::collections::HashMap<i32, (u64, f64, i16)>>>;
+
+    let pv_stats_sink: Arc<PvStatsSink> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let inline_meta_store: Arc<std::sync::Mutex<Vec<aura_core::metadata::PvMetadata>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -572,428 +572,418 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         tokio::select! {
-            Some((addr, new_cmd_tx)) = reconnect_rx.recv() => {
-                driver.session_commands_mut().insert(addr, new_cmd_tx);
-                println!("{c_met}[{}]{c_rst} {c_ok}net  IOC {} reconnected — commands routed{c_rst}", ts(), addr);
-            }
-
-            Some(event) = lifecycle_rx.recv() => {
-                use aura_net::runtime::driver::LifecycleEvent;
-                match event {
-                    LifecycleEvent::Disconnected { addr, pvs, reason } => {
-                        ingest_metrics.disconnects.fetch_add(1, Ordering::Relaxed);
-                        let n = pvs.len();
-                        println!("{c_met}[{}]{c_rst} {c_warn}net  IOC {addr} disconnected ({n} PVs) — {reason}{c_rst}", ts());
-                        handlers::handle_disconnect(&pool, &shared_pv_cache, &shared_writer_buf, addr, &pvs, &reason).await;
-                    }
-                    LifecycleEvent::Reconnected { addr, pvs } => {
-                        ingest_metrics.reconnects.fetch_add(1, Ordering::Relaxed);
-                        let n = pvs.len();
-                        println!("{c_met}[{}]{c_rst} {c_ok}net  IOC {addr} reconnected ({n} PVs){c_rst}", ts());
-                        handlers::handle_reconnect(&pool, &shared_pv_cache, &shared_writer_buf, addr, &pvs).await;
-                    }
-                }
-            }
-
-            _ = stats_timer.tick() => {
-                handlers::drain_metadata(&pool, &driver, &inline_meta_store, &mut metadata_stored_pvs).await;
-                handlers::update_pv_status(&pool, &pv_stats_sink, &shared_pv_cache, &shared_writer_buf).await;
-
-                // Reload per-PV heartbeat config every 30s (every 3rd stats tick).
-                {
-                    static TICK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if TICK_COUNT.fetch_add(1, Ordering::Relaxed) % 3 == 0 {
-                        if let Ok(hb_rows) = sqlx::query_as::<_, (i32, f64)>(
-                            "SELECT l.pv_id, COALESCE(c.heartbeat_s, -1.0) FROM pv_config c \
-                             JOIN pv_lookup l ON l.pv_name = c.pv_name \
-                             WHERE c.enabled = TRUE"
-                        ).fetch_all(&pool).await {
-                            let overrides: Vec<(i32, f32)> = hb_rows.iter().map(|&(id, hs)| (id, hs as f32)).collect();
-                            heartbeat_config.store(Arc::new(overrides));
+                        Some((addr, new_cmd_tx)) = reconnect_rx.recv() => {
+                            driver.session_commands_mut().insert(addr, new_cmd_tx);
+                            println!("{c_met}[{}]{c_rst} {c_ok}net  IOC {} reconnected — commands routed{c_rst}", ts(), addr);
                         }
-                    }
-                }
 
-                let snap = ingest_metrics.snapshot();
-                let ev = snap.events_received;
-                if ev > 0 {
-                    let buf_drops: u64 = shared_writer_bufs.iter().map(|b| b.total_dropped()).sum();
-                    let bus_drops = bus_tx_stats.total_dropped();
-                    println!("{c_met}[{}]{c_rst} {c_id}sta{c_rst}  events={c_val}{}{c_rst} pub={c_val}{}{c_rst} skip={c_val}{}{c_rst} dc={c_val}{}{c_rst} bus_drop={c_val}{}{c_rst} buf_drop={c_val}{}{c_rst} drop_pv={c_val}{}{c_rst} sessions={c_val}{}{c_rst} fast={c_val}{}%{c_rst}",
-                        ts(), snap.events_received, snap.events_published,
-                        snap.events_skipped, snap.disconnects,
-                        bus_drops, buf_drops, snap.events_dropped_unknown_pv,
-                        driver.session_count(), snap.fast_path_pct);
-
-                    // Data-loss alert: raised when the total drop count grows,
-                    // throttled to one alert_log row per ~5 min (30 ticks).
-                    {
-                        static LAST_TOTAL_DROPS: AtomicU64 = AtomicU64::new(0);
-                        static LAST_ALERT_TICK: AtomicU64 = AtomicU64::new(0);
-                        static DROP_TICK: AtomicU64 = AtomicU64::new(0);
-                        let tick = DROP_TICK.fetch_add(1, Ordering::Relaxed);
-                        let total = bus_drops + buf_drops + snap.events_dropped_unknown_pv;
-                        let prev = LAST_TOTAL_DROPS.swap(total, Ordering::Relaxed);
-                        let last_alert = LAST_ALERT_TICK.load(Ordering::Relaxed);
-                        if total > prev && (last_alert == 0 || tick.saturating_sub(last_alert) >= 30) {
-                            LAST_ALERT_TICK.store(tick.max(1), Ordering::Relaxed);
-                            let alert = aura_store::alerts::Alert::new(
-                                aura_core::AlertLevel::Critical,
-                                aura_store::alerts::AlertCategory::System,
-                                format!("data loss: {} events dropped since startup (+{} in last interval)",
-                                    total, total - prev),
-                            )
-                            .with_details(serde_json::json!({
-                                "bus_channel_full": bus_drops,
-                                "shared_buffer_full": buf_drops,
-                                "unknown_pv": snap.events_dropped_unknown_pv,
-                            }));
-                            let alert_pool = pool.clone();
-                            tokio::spawn(async move {
-                                let _ = aura_store::alerts::AlertDao::write(&alert_pool, &alert).await;
-                            });
-                        }
-                    }
-                }
-
-                // Re-tune chunk interval every 5 min from actual throughput
-                if last_chunk_tune.elapsed() > Duration::from_secs(300) {
-                    let elapsed = last_chunk_tune.elapsed().as_secs().max(1);
-                    let delta = ev.saturating_sub(chunk_tune_last_events);
-                    let rate = (delta / elapsed) as usize;
-                    if rate > 0 {
-                        let new_secs = (chunk_max_rows / rate).max(60).min(86400) as u64;
-                        let ratio = if new_secs > current_chunk_secs {
-                            new_secs as f64 / current_chunk_secs.max(1) as f64
-                        } else {
-                            current_chunk_secs as f64 / new_secs.max(1) as f64
-                        };
-                        if ratio > 1.3 {
-                            let interval = format_chunk_interval(new_secs);
-                            if let Err(e) = sqlx::query("SELECT set_chunk_time_interval('samples', $1::interval)")
-                                .bind(&interval).execute(&pool).await {
-                                tracing::warn!("chunk re-tune failed: {e}");
-                            } else {
-                                current_chunk_secs = new_secs;
-                                println!("{c_met}[{}]{c_rst} {c_ok}db   chunk re-tuned: {interval} (measured {}k events/s){c_rst}",
-                                    ts(), rate / 1000);
+                        Some(event) = lifecycle_rx.recv() => {
+                            use aura_net::runtime::driver::LifecycleEvent;
+                            match event {
+                                LifecycleEvent::Disconnected { addr, pvs, reason } => {
+                                    ingest_metrics.disconnects.fetch_add(1, Ordering::Relaxed);
+                                    let n = pvs.len();
+                                    println!("{c_met}[{}]{c_rst} {c_warn}net  IOC {addr} disconnected ({n} PVs) — {reason}{c_rst}", ts());
+                                    handlers::handle_disconnect(&pool, &shared_pv_cache, &shared_writer_buf, addr, &pvs, &reason).await;
+                                }
+                                LifecycleEvent::Reconnected { addr, pvs } => {
+                                    ingest_metrics.reconnects.fetch_add(1, Ordering::Relaxed);
+                                    let n = pvs.len();
+                                    println!("{c_met}[{}]{c_rst} {c_ok}net  IOC {addr} reconnected ({n} PVs){c_rst}", ts());
+                                    handlers::handle_reconnect(&pool, &shared_pv_cache, &shared_writer_buf, addr, &pvs).await;
+                                }
                             }
                         }
-                    }
-                    chunk_tune_last_events = ev;
-                    last_chunk_tune = Instant::now();
-                }
-            }
 
-            Some(msg) = cmd_stream.next() => {
-                let payload: String = match msg.get_payload() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
+                        _ = stats_timer.tick() => {
+                            handlers::drain_metadata(&pool, &driver, &inline_meta_store, &mut metadata_stored_pvs).await;
+                            handlers::update_pv_status(&pool, &pv_stats_sink, &shared_pv_cache, &shared_writer_buf).await;
 
-                // Collect this command and drain any additional pending commands.
-                let mut subscribe_pvs: Vec<String> = Vec::new();
-                let mut other_cmds: Vec<aura_discover::IngestCommand> = Vec::new();
+                            // Reload per-PV heartbeat config every 30s (every 3rd stats tick).
+                            {
+                                static TICK_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                if TICK_COUNT.fetch_add(1, Ordering::Relaxed).is_multiple_of(3) && let Ok(hb_rows) = sqlx::query_as::<_, (i32, f64)>(
+                                        "SELECT l.pv_id, COALESCE(c.heartbeat_s, -1.0) FROM pv_config c \
+                                         JOIN pv_lookup l ON l.pv_name = c.pv_name \
+                                         WHERE c.enabled = TRUE"
+                                    ).fetch_all(&pool).await {
+                                        let overrides: Vec<(i32, f32)> = hb_rows.iter().map(|&(id, hs)| (id, hs as f32)).collect();
+                                        heartbeat_config.store(Arc::new(overrides));
+                                    }
+                            }
 
-                if let Some(cmd) = aura_discover::IngestCommand::from_json(&payload) {
-                    match cmd {
-                        aura_discover::IngestCommand::Subscribe { pv, .. } => subscribe_pvs.push(pv),
-                        aura_discover::IngestCommand::SubscribeBatch { pvs, .. } => {
-                            // Filter out PVs already subscribed (prevents double-subscribe at startup).
-                            let new_pvs: Vec<String> = pvs.into_iter()
-                                .filter(|pv| !driver.pv_server_cache().contains_key(pv))
-                                .collect();
-                            if !new_pvs.is_empty() {
-                                subscribe_pvs.extend(new_pvs);
+                            let snap = ingest_metrics.snapshot();
+                            let ev = snap.events_received;
+                            if ev > 0 {
+                                let buf_drops: u64 = shared_writer_bufs.iter().map(|b| b.total_dropped()).sum();
+                                let bus_drops = bus_tx_stats.total_dropped();
+                                println!("{c_met}[{}]{c_rst} {c_id}sta{c_rst}  events={c_val}{}{c_rst} pub={c_val}{}{c_rst} skip={c_val}{}{c_rst} dc={c_val}{}{c_rst} bus_drop={c_val}{}{c_rst} buf_drop={c_val}{}{c_rst} drop_pv={c_val}{}{c_rst} sessions={c_val}{}{c_rst} fast={c_val}{}%{c_rst}",
+                                    ts(), snap.events_received, snap.events_published,
+                                    snap.events_skipped, snap.disconnects,
+                                    bus_drops, buf_drops, snap.events_dropped_unknown_pv,
+                                    driver.session_count(), snap.fast_path_pct);
+
+                                // Data-loss alert: raised when the total drop count grows,
+                                // throttled to one alert_log row per ~5 min (30 ticks).
+                                {
+                                    static LAST_TOTAL_DROPS: AtomicU64 = AtomicU64::new(0);
+                                    static LAST_ALERT_TICK: AtomicU64 = AtomicU64::new(0);
+                                    static DROP_TICK: AtomicU64 = AtomicU64::new(0);
+                                    let tick = DROP_TICK.fetch_add(1, Ordering::Relaxed);
+                                    let total = bus_drops + buf_drops + snap.events_dropped_unknown_pv;
+                                    let prev = LAST_TOTAL_DROPS.swap(total, Ordering::Relaxed);
+                                    let last_alert = LAST_ALERT_TICK.load(Ordering::Relaxed);
+                                    if total > prev && (last_alert == 0 || tick.saturating_sub(last_alert) >= 30) {
+                                        LAST_ALERT_TICK.store(tick.max(1), Ordering::Relaxed);
+                                        let alert = aura_store::alerts::Alert::new(
+                                            aura_core::AlertLevel::Critical,
+                                            aura_store::alerts::AlertCategory::System,
+                                            format!("data loss: {} events dropped since startup (+{} in last interval)",
+                                                total, total - prev),
+                                        )
+                                        .with_details(serde_json::json!({
+                                            "bus_channel_full": bus_drops,
+                                            "shared_buffer_full": buf_drops,
+                                            "unknown_pv": snap.events_dropped_unknown_pv,
+                                        }));
+                                        let alert_pool = pool.clone();
+                                        tokio::spawn(async move {
+                                            let _ = aura_store::alerts::AlertDao::write(&alert_pool, &alert).await;
+                                        });
+                                    }
+                                }
+                            }
+
+                            // Re-tune chunk interval every 5 min from actual throughput
+                            if last_chunk_tune.elapsed() > Duration::from_secs(300) {
+                                let elapsed = last_chunk_tune.elapsed().as_secs().max(1);
+                                let delta = ev.saturating_sub(chunk_tune_last_events);
+                                let rate = (delta / elapsed) as usize;
+        if let Some(new_secs) = chunk_max_rows.checked_div(rate).map(|r| r.clamp(60, 86400) as u64) {
+                                    let ratio = if new_secs > current_chunk_secs {
+                new_secs as f64 / current_chunk_secs.max(1) as f64
+            } else {
+                current_chunk_secs as f64 / new_secs.max(1) as f64
+            };
+                                    if ratio > 1.3 {
+                                        let interval = format_chunk_interval(new_secs);
+                                        if let Err(e) = sqlx::query("SELECT set_chunk_time_interval('samples', $1::interval)")
+                                            .bind(&interval).execute(&pool).await {
+                                            tracing::warn!("chunk re-tune failed: {e}");
+                                        } else {
+                                            current_chunk_secs = new_secs;
+                                            println!("{c_met}[{}]{c_rst} {c_ok}db   chunk re-tuned: {interval} (measured {}k events/s){c_rst}",
+                                                ts(), rate / 1000);
+                                        }
+                                    }
+                                }
+                                chunk_tune_last_events = ev;
+                                last_chunk_tune = Instant::now();
                             }
                         }
-                        other => other_cmds.push(other),
-                    }
-                }
 
-                // Drain all pending messages from the stream (non-blocking).
-                loop {
-                    match tokio::time::timeout(
-                        Duration::from_millis(1),
-                        cmd_stream.next()
-                    ).await {
-                        Ok(Some(msg)) => {
-                            let p: String = match msg.get_payload() {
+                        Some(msg) = cmd_stream.next() => {
+                            let payload: String = match msg.get_payload() {
                                 Ok(p) => p,
                                 Err(_) => continue,
                             };
-                            if let Some(cmd) = aura_discover::IngestCommand::from_json(&p) {
+
+                            // Collect this command and drain any additional pending commands.
+                            let mut subscribe_pvs: Vec<String> = Vec::new();
+                            let mut other_cmds: Vec<aura_discover::IngestCommand> = Vec::new();
+
+                            if let Some(cmd) = aura_discover::IngestCommand::from_json(&payload) {
                                 match cmd {
                                     aura_discover::IngestCommand::Subscribe { pv, .. } => subscribe_pvs.push(pv),
-                                    aura_discover::IngestCommand::SubscribeBatch { pvs, .. } => subscribe_pvs.extend(pvs),
+                                    aura_discover::IngestCommand::SubscribeBatch { pvs, .. } => {
+                                        // Filter out PVs already subscribed (prevents double-subscribe at startup).
+                                        let new_pvs: Vec<String> = pvs.into_iter()
+                                            .filter(|pv| !driver.pv_server_cache().contains_key(pv))
+                                            .collect();
+                                        if !new_pvs.is_empty() {
+                                            subscribe_pvs.extend(new_pvs);
+                                        }
+                                    }
                                     other => other_cmds.push(other),
                                 }
                             }
-                        }
-                        _ => break,
-                    }
-                }
 
-                // Process batch subscribes.
-                if !subscribe_pvs.is_empty() {
-                    let count = subscribe_pvs.len();
-                    println!("{c_met}[{}]{c_rst} {c_id}net{c_rst}  subscribing to {count} PVs...", ts());
-
-                    let sub = handlers::subscribe_pvs(
-                        &pool, &mut driver, &mut engine, &shared_pv_cache,
-                        &subscribe_pvs, "subscribed (orchestrator)",
-                    ).await;
-                    monitors.extend(sub.handles);
-                    let ok_pvs = sub.ok_pvs;
-                    let fail = sub.failed;
-
-                    if !ok_pvs.is_empty() {
-                        let expected = ok_pvs.len();
-                        let timeout_s = 3 + (expected as u64 / 10000).max(1);
-                        let n = handlers::collect_initial_metadata(
-                            &pool, &driver, &mut engine, &mut metadata_stored_pvs, expected, timeout_s,
-                        ).await;
-                        println!("{c_met}[{}]{c_rst} {c_ok}db   ✓ {n}/{expected} metadata stored{c_rst}", ts());
-                        engine.total_published = 0;
-                        engine.total_events = 0;
-                        engine.total_skipped = 0;
-                    }
-
-                    let ok = ok_pvs.len();
-                    println!("{c_met}[{}]{c_rst} {c_ok}net  ✓ {ok}/{count} PVs ready to archive{c_rst}{}", ts(),
-                        if fail > 0 { format!(" ({fail} failed)") } else { String::new() });
-
-
-
-                    if !monitors.is_empty() && ingest_handles.is_empty() {
-                        let ctx = aura_ingest::thread::IngestContext {
-                            ingest_threads, config: config.clone(),
-                            shared_bufs: shared_writer_bufs.clone(),
-                            shared_pv_cache: shared_pv_cache.clone(),
-                            inline_meta_store: inline_meta_store.clone(),
-                            pv_stats_sink: pv_stats_sink.clone(),
-                            metrics: ingest_metrics.clone(),
-                            shutdown: ingest_shutdown.clone(),
-                            heartbeat_config: heartbeat_config.clone(),
-                        };
-                        let mut bus_rxs_vec = std::mem::take(&mut bus_rxs);
-                        let (handles, _tokens) = aura_ingest::thread::setup_shards_and_spawn(
-                            &mut monitors, ingest_threads, &mut bus_rxs_vec, &ctx,
-                        );
-                        ingest_handles = handles;
-                        println!("{c_met}[{}]{c_rst} {c_ok}thr  {ingest_threads} ingest threads active{c_rst}", ts());
-                    }
-                }
-
-                    for cmd in other_cmds {
-                    match cmd {
-                        aura_discover::IngestCommand::Unsubscribe { pv } => {
-                            driver.unsubscribe(&[pv.clone()]).await;
-                            if let Some(idx) = monitors.iter().position(|h| h.pv_name() == pv) {
-                                monitors[idx].cancel();
-                                monitors.swap_remove(idx);
-                            }
-                            engine.unregister_pv(&pv);
-                            {
-                                let mut new_map = (**shared_pv_cache.load()).clone();
-                                new_map.remove(pv.as_str());
-                                shared_pv_cache.store(Arc::new(new_map));
-                            }
-                            let _ = sqlx::query("UPDATE pv_status SET state = 6 WHERE pv_name = $1").bind(&pv).execute(&pool).await;
-                            let _ = sqlx::query("INSERT INTO pv_events (pv_name, event_type, detail) VALUES ($1, 6, 'unsubscribed')")
-                                .bind(&pv).execute(&pool).await;
-                            println!("{c_met}[{}]{c_rst} {c_id}net{c_rst}  ✕ {pv} unsubscribed", ts());
-                        }
-                        aura_discover::IngestCommand::UnsubscribeBatch { pvs } => {
-                            let count = pvs.len();
-                            driver.unsubscribe(&pvs).await;
-                            for pv in &pvs {
-                                if let Some(idx) = monitors.iter().position(|h| h.pv_name() == *pv) {
-                                    monitors[idx].cancel();
-                                    monitors.swap_remove(idx);
-                                }
-                                engine.unregister_pv(pv);
-                            }
-                            {
-                                let mut new_map = (**shared_pv_cache.load()).clone();
-                                for pv in &pvs { new_map.remove(pv.as_str()); }
-                                shared_pv_cache.store(Arc::new(new_map));
-                            }
-                            let names: Vec<&str> = pvs.iter().map(|s| s.as_str()).collect();
-                            let _ = sqlx::query("UPDATE pv_status SET state = 6 WHERE pv_name = ANY($1::text[])").bind(&names).execute(&pool).await;
-                            let _ = sqlx::query(
-                                "INSERT INTO pv_events (pv_name, event_type, detail) SELECT unnest($1::text[]), 6, 'batch unsubscribed'"
-                            ).bind(&names).execute(&pool).await;
-                            println!("{c_met}[{}]{c_rst} {c_id}net{c_rst}  ✕ {count} PVs unsubscribed (batch)", ts());
-                        }
-                        aura_discover::IngestCommand::Reload => {
-                            println!("{c_met}[{}]{c_rst} {c_id}net{c_rst}  Reload requested", ts());
-                        }
-                        _ => {}
-                    }
+                            // Drain all pending messages from the stream (non-blocking).
+        while let Ok(Some(msg)) = tokio::time::timeout(
+            Duration::from_millis(1),
+            cmd_stream.next()
+        ).await {
+            let p: String = match msg.get_payload() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if let Some(cmd) = aura_discover::IngestCommand::from_json(&p) {
+                match cmd {
+                    aura_discover::IngestCommand::Subscribe { pv, .. } => subscribe_pvs.push(pv),
+                    aura_discover::IngestCommand::SubscribeBatch { pvs, .. } => subscribe_pvs.extend(pvs),
+                    other => other_cmds.push(other),
                 }
             }
+        }
 
-            Some(cmd_json) = notify_rx.recv() => {
-                // IOC change is not an IngestCommand variant - handle raw JSON first.
-                if cmd_json.contains("\"ioc_change\"") {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cmd_json) {
-                        if v.get("cmd").and_then(|c| c.as_str()) == Some("ioc_change") {
-                            // IOC config changed — reload + hot-add new IOCs.
-                            println!("{c_met}[{}]{c_rst} {c_id}ioc{c_rst}  IOC config changed (DB NOTIFY)", ts());
-                            let rows: Vec<(String,)> = sqlx::query_as("SELECT address FROM ioc_config WHERE enabled = TRUE")
-                                .fetch_all(&pool).await.unwrap_or_default();
-                            let new_addrs: Vec<std::net::SocketAddr> = rows.iter()
-                                .filter_map(|(a,)| a.parse::<std::net::SocketAddr>().ok())
-                                .collect();
-                            let old_addrs = driver.ioc_addresses();
-                            let added: Vec<std::net::SocketAddr> = new_addrs.iter()
-                                .filter(|a| !old_addrs.contains(a))
-                                .copied()
-                                .collect();
-                            let removed: Vec<std::net::SocketAddr> = old_addrs.iter()
-                                .filter(|a| !new_addrs.contains(a))
-                                .copied()
-                                .collect();
-                            driver.set_name_servers(new_addrs);
-                            for addr in &removed {
-                                if let Some(pvs) = driver.ioc_pvs().get(addr) {
-                                    let names: Vec<&str> = pvs.iter().map(|s| s.as_str()).collect();
-                                    let addr_str = addr.to_string();
-                                    let _ = sqlx::query(
-                                        "INSERT INTO pv_events (pv_name, event_type, ioc_addr, detail) \
-                                         SELECT unnest($1::text[]), 7, $2, 'IOC removed via NOTIFY'"
-                                    ).bind(&names).bind(&addr_str).execute(&pool).await;
+                            // Process batch subscribes.
+                            if !subscribe_pvs.is_empty() {
+                                let count = subscribe_pvs.len();
+                                println!("{c_met}[{}]{c_rst} {c_id}net{c_rst}  subscribing to {count} PVs...", ts());
+
+                                let sub = handlers::subscribe_pvs(
+                                    &pool, &mut driver, &mut engine, &shared_pv_cache,
+                                    &subscribe_pvs, "subscribed (orchestrator)",
+                                ).await;
+                                monitors.extend(sub.handles);
+                                let ok_pvs = sub.ok_pvs;
+                                let fail = sub.failed;
+
+                                if !ok_pvs.is_empty() {
+                                    let expected = ok_pvs.len();
+                                    let timeout_s = 3 + (expected as u64 / 10000).max(1);
+                                    let n = handlers::collect_initial_metadata(
+                                        &pool, &driver, &mut engine, &mut metadata_stored_pvs, expected, timeout_s,
+                                    ).await;
+                                    println!("{c_met}[{}]{c_rst} {c_ok}db   ✓ {n}/{expected} metadata stored{c_rst}", ts());
+                                    engine.total_published = 0;
+                                    engine.total_events = 0;
+                                    engine.total_skipped = 0;
                                 }
-                                driver.remove_session(addr);
-                                println!("{c_met}[{}]{c_rst} {c_warn}ioc  {} removed{c_rst}", ts(), addr);
+
+                                let ok = ok_pvs.len();
+                                println!("{c_met}[{}]{c_rst} {c_ok}net  ✓ {ok}/{count} PVs ready to archive{c_rst}{}", ts(),
+                                    if fail > 0 { format!(" ({fail} failed)") } else { String::new() });
+
+
+
+                                if !monitors.is_empty() && ingest_handles.is_empty() {
+                                    let ctx = aura_ingest::thread::IngestContext {
+                                        ingest_threads, config: config.clone(),
+                                        shared_bufs: shared_writer_bufs.clone(),
+                                        shared_pv_cache: shared_pv_cache.clone(),
+                                        inline_meta_store: inline_meta_store.clone(),
+                                        pv_stats_sink: pv_stats_sink.clone(),
+                                        metrics: ingest_metrics.clone(),
+                                        shutdown: ingest_shutdown.clone(),
+                                        heartbeat_config: heartbeat_config.clone(),
+                                    };
+                                    let mut bus_rxs_vec = std::mem::take(&mut bus_rxs);
+                                    let (handles, _tokens) = aura_ingest::thread::setup_shards_and_spawn(
+                                        &mut monitors, ingest_threads, &mut bus_rxs_vec, &ctx,
+                                    );
+                                    ingest_handles = handles;
+                                    println!("{c_met}[{}]{c_rst} {c_ok}thr  {ingest_threads} ingest threads active{c_rst}", ts());
+                                }
                             }
-                            for addr in added {
-                                let all_configured: Vec<String> = sqlx::query_as::<_, (String,)>(
-                                    "SELECT pv_name FROM pv_config WHERE enabled = TRUE"
-                                ).fetch_all(&pool).await.unwrap_or_default()
-                                    .into_iter().map(|(n,)| n).collect();
-                                let recovered = driver.hot_add_ioc(addr, &all_configured).await;
-                                if !recovered.is_empty() {
-                                    let count = recovered.len();
-                                    let names: Vec<&str> = recovered.iter().map(|s| s.as_str()).collect();
-                                    let _ = sqlx::query("INSERT INTO pv_lookup (pv_name) SELECT unnest($1::text[]) ON CONFLICT DO NOTHING")
-                                        .bind(&names).execute(&pool).await;
-                                    let rows: Vec<(String, i32)> = sqlx::query_as(
-                                        "SELECT pv_name, pv_id FROM pv_lookup WHERE pv_name = ANY($1::text[])"
-                                    ).bind(&names).fetch_all(&pool).await.unwrap_or_default();
-                                    {
-                                        let mut new_map = (**shared_pv_cache.load()).clone();
-                                        for (name, id) in rows {
-                                            new_map.insert(Arc::from(name.as_str()), id);
+
+                                for cmd in other_cmds {
+                                match cmd {
+                                    aura_discover::IngestCommand::Unsubscribe { pv } => {
+                                        driver.unsubscribe(std::slice::from_ref(&pv)).await;
+                                        if let Some(idx) = monitors.iter().position(|h| h.pv_name() == pv) {
+                                            monitors[idx].cancel();
+                                            monitors.swap_remove(idx);
                                         }
-                                        shared_pv_cache.store(Arc::new(new_map));
+                                        engine.unregister_pv(&pv);
+                                        {
+                                            let mut new_map = (**shared_pv_cache.load()).clone();
+                                            new_map.remove(pv.as_str());
+                                            shared_pv_cache.store(Arc::new(new_map));
+                                        }
+                                        let _ = sqlx::query("UPDATE pv_status SET state = 6 WHERE pv_name = $1").bind(&pv).execute(&pool).await;
+                                        let _ = sqlx::query("INSERT INTO pv_events (pv_name, event_type, detail) VALUES ($1, 6, 'unsubscribed')")
+                                            .bind(&pv).execute(&pool).await;
+                                        println!("{c_met}[{}]{c_rst} {c_id}net{c_rst}  ✕ {pv} unsubscribed", ts());
                                     }
-                                    println!("{c_met}[{}]{c_rst} {c_ok}ioc  {} added — {count} PVs recovered{c_rst}", ts(), addr);
-                                } else {
-                                    println!("{c_met}[{}]{c_rst} {c_ok}ioc  {} added (0 PVs recovered){c_rst}", ts(), addr);
+                                    aura_discover::IngestCommand::UnsubscribeBatch { pvs } => {
+                                        let count = pvs.len();
+                                        driver.unsubscribe(&pvs).await;
+                                        for pv in &pvs {
+                                            if let Some(idx) = monitors.iter().position(|h| h.pv_name() == *pv) {
+                                                monitors[idx].cancel();
+                                                monitors.swap_remove(idx);
+                                            }
+                                            engine.unregister_pv(pv);
+                                        }
+                                        {
+                                            let mut new_map = (**shared_pv_cache.load()).clone();
+                                            for pv in &pvs { new_map.remove(pv.as_str()); }
+                                            shared_pv_cache.store(Arc::new(new_map));
+                                        }
+                                        let names: Vec<&str> = pvs.iter().map(|s| s.as_str()).collect();
+                                        let _ = sqlx::query("UPDATE pv_status SET state = 6 WHERE pv_name = ANY($1::text[])").bind(&names).execute(&pool).await;
+                                        let _ = sqlx::query(
+                                            "INSERT INTO pv_events (pv_name, event_type, detail) SELECT unnest($1::text[]), 6, 'batch unsubscribed'"
+                                        ).bind(&names).execute(&pool).await;
+                                        println!("{c_met}[{}]{c_rst} {c_id}net{c_rst}  ✕ {count} PVs unsubscribed (batch)", ts());
+                                    }
+                                    aura_discover::IngestCommand::Reload => {
+                                        println!("{c_met}[{}]{c_rst} {c_id}net{c_rst}  Reload requested", ts());
+                                    }
+                                    _ => {}
                                 }
                             }
-                            continue;
                         }
-                    }
-                }
-                if let Some(cmd) = aura_discover::IngestCommand::from_json(&cmd_json) {
-                    match cmd {
-                        cmd @ aura_discover::IngestCommand::Subscribe { .. }
-                        | cmd @ aura_discover::IngestCommand::SubscribeBatch { .. }
-                        => {
-                            // Collect PVs from this message.
-                            let mut subscribe_pvs: Vec<String> = match cmd {
-                                aura_discover::IngestCommand::Subscribe { pv, .. } => vec![pv],
-                                aura_discover::IngestCommand::SubscribeBatch { pvs, .. } => pvs,
-                                _ => unreachable!(),
-                            };
-                            // Drain pending NOTIFY messages (100ms window) to aggregate batches.
-                            // PostgreSQL splits large inserts into 578-PV chunks — we recombine them.
-                            loop {
-                                match tokio::time::timeout(
-                                    Duration::from_millis(100),
-                                    notify_rx.recv()
-                                ).await {
-                                    Ok(Some(next_json)) => {
-                                        if next_json.contains("\"ioc_change\"") {
-                                            // IOC change - process after this batch.
-                                            // Re-inject by handling inline (rare).
-                                            break;
+
+                        Some(cmd_json) = notify_rx.recv() => {
+                            // IOC change is not an IngestCommand variant - handle raw JSON first.
+                            if cmd_json.contains("\"ioc_change\"")
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(&cmd_json)
+                    && v.get("cmd").and_then(|c| c.as_str()) == Some("ioc_change")
+                {
+                    // IOC config changed — reload + hot-add new IOCs.
+                    println!("{c_met}[{}]{c_rst} {c_id}ioc{c_rst}  IOC config changed (DB NOTIFY)", ts());
+                                        let rows: Vec<(String,)> = sqlx::query_as("SELECT address FROM ioc_config WHERE enabled = TRUE")
+                                            .fetch_all(&pool).await.unwrap_or_default();
+                                        let new_addrs: Vec<std::net::SocketAddr> = rows.iter()
+                                            .filter_map(|(a,)| a.parse::<std::net::SocketAddr>().ok())
+                                            .collect();
+                                        let old_addrs = driver.ioc_addresses();
+                                        let added: Vec<std::net::SocketAddr> = new_addrs.iter()
+                                            .filter(|a| !old_addrs.contains(a))
+                                            .copied()
+                                            .collect();
+                                        let removed: Vec<std::net::SocketAddr> = old_addrs.iter()
+                                            .filter(|a| !new_addrs.contains(a))
+                                            .copied()
+                                            .collect();
+                                        driver.set_name_servers(new_addrs);
+                                        for addr in &removed {
+                                            if let Some(pvs) = driver.ioc_pvs().get(addr) {
+                                                let names: Vec<&str> = pvs.iter().map(|s| s.as_str()).collect();
+                                                let addr_str = addr.to_string();
+                                                let _ = sqlx::query(
+                                                    "INSERT INTO pv_events (pv_name, event_type, ioc_addr, detail) \
+                                                     SELECT unnest($1::text[]), 7, $2, 'IOC removed via NOTIFY'"
+                                                ).bind(&names).bind(&addr_str).execute(&pool).await;
+                                            }
+                                            driver.remove_session(addr);
+                                            println!("{c_met}[{}]{c_rst} {c_warn}ioc  {} removed{c_rst}", ts(), addr);
                                         }
-                                        if let Some(next_cmd) = aura_discover::IngestCommand::from_json(&next_json) {
-                                            match next_cmd {
-                                                aura_discover::IngestCommand::Subscribe { pv, .. } => subscribe_pvs.push(pv),
-                                                aura_discover::IngestCommand::SubscribeBatch { pvs, .. } => subscribe_pvs.extend(pvs),
-                                                _ => break,
+                                        for addr in added {
+                                            let all_configured: Vec<String> = sqlx::query_as::<_, (String,)>(
+                                                "SELECT pv_name FROM pv_config WHERE enabled = TRUE"
+                                            ).fetch_all(&pool).await.unwrap_or_default()
+                                                .into_iter().map(|(n,)| n).collect();
+                                            let recovered = driver.hot_add_ioc(addr, &all_configured).await;
+                                            if !recovered.is_empty() {
+                                                let count = recovered.len();
+                                                let names: Vec<&str> = recovered.iter().map(|s| s.as_str()).collect();
+                                                let _ = sqlx::query("INSERT INTO pv_lookup (pv_name) SELECT unnest($1::text[]) ON CONFLICT DO NOTHING")
+                                                    .bind(&names).execute(&pool).await;
+                                                let rows: Vec<(String, i32)> = sqlx::query_as(
+                                                    "SELECT pv_name, pv_id FROM pv_lookup WHERE pv_name = ANY($1::text[])"
+                                                ).bind(&names).fetch_all(&pool).await.unwrap_or_default();
+                                                {
+                                                    let mut new_map = (**shared_pv_cache.load()).clone();
+                                                    for (name, id) in rows {
+                                                        new_map.insert(Arc::from(name.as_str()), id);
+                                                    }
+                                                    shared_pv_cache.store(Arc::new(new_map));
+                                                }
+                                                println!("{c_met}[{}]{c_rst} {c_ok}ioc  {} added — {count} PVs recovered{c_rst}", ts(), addr);
+                                            } else {
+                                                println!("{c_met}[{}]{c_rst} {c_ok}ioc  {} added (0 PVs recovered){c_rst}", ts(), addr);
                                             }
                                         }
+                                        continue;
+
+
+                            }
+                            if let Some(cmd) = aura_discover::IngestCommand::from_json(&cmd_json) {
+                                match cmd {
+                                    cmd @ aura_discover::IngestCommand::Subscribe { .. }
+                                    | cmd @ aura_discover::IngestCommand::SubscribeBatch { .. }
+                                    => {
+                                        // Collect PVs from this message.
+                                        let mut subscribe_pvs: Vec<String> = match cmd {
+                                            aura_discover::IngestCommand::Subscribe { pv, .. } => vec![pv],
+                                            aura_discover::IngestCommand::SubscribeBatch { pvs, .. } => pvs,
+                                            _ => unreachable!(),
+                                        };
+                                        // Drain pending NOTIFY messages (100ms window) to aggregate batches.
+                                        // PostgreSQL splits large inserts into 578-PV chunks — we recombine them.
+                                        while let Ok(Some(next_json)) = tokio::time::timeout(
+                                                Duration::from_millis(100),
+                                                notify_rx.recv()
+                                            ).await {
+                                                if next_json.contains("\"ioc_change\"") {
+                                                    // IOC change - process after this batch.
+                                                    // Re-inject by handling inline (rare).
+                                                    break;
+                                                }
+                                                if let Some(next_cmd) = aura_discover::IngestCommand::from_json(&next_json) {
+                                                    match next_cmd {
+                                                        aura_discover::IngestCommand::Subscribe { pv, .. } => subscribe_pvs.push(pv),
+                                                        aura_discover::IngestCommand::SubscribeBatch { pvs, .. } => subscribe_pvs.extend(pvs),
+                                                        _ => break,
+                                                    }
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        let new_pvs: Vec<String> = subscribe_pvs.into_iter()
+                                            .filter(|pv| !driver.pv_server_cache().contains_key(pv))
+                                            .collect();
+                                        if new_pvs.is_empty() { continue; }
+                                        let count = new_pvs.len();
+                                        if count == 1 {
+                                            println!("{c_met}[{}]{c_rst} {c_id}pv {c_rst}  +{c_val}{}{c_rst} (DB NOTIFY)", ts(), &new_pvs[0]);
+                                        } else {
+                                            println!("{c_met}[{}]{c_rst} {c_id}pv {c_rst}  +{c_val}{count} PVs{c_rst} (DB NOTIFY)", ts());
+                                        }
+                                        // Pre-register in pv_lookup + pv_cache BEFORE subscribing.
+                                        // This ensures pv_id is resolvable when the first events arrive.
+                                        let sub = handlers::subscribe_pvs(
+                                            &pool, &mut driver, &mut engine, &shared_pv_cache,
+                                            &new_pvs, "dynamic subscribe via NOTIFY",
+                                        ).await;
+                                        let ok_pvs = sub.ok_pvs;
+                                        if sub.failed > 0 {
+                                            let failed: Vec<&str> = new_pvs.iter()
+                                                .filter(|pv| !ok_pvs.iter().any(|ok| ok == *pv))
+                                                .map(|s| s.as_str()).take(5).collect();
+                                            println!("{c_met}[{}]{c_rst} {c_warn}pv   {} PVs not found on any IOC (e.g. {:?}){c_rst}", ts(), sub.failed, failed);
+                                        }
+                                        if !ok_pvs.is_empty() {
+                                            println!("{c_met}[{}]{c_rst} {c_ok}pv   {} PVs added to hot path{c_rst}", ts(), ok_pvs.len());
+                                        }
                                     }
-                                    _ => break,
+                                    aura_discover::IngestCommand::Unsubscribe { pv } => {
+                                        println!("{c_met}[{}]{c_rst} {c_id}pv {c_rst}  -{c_val}{pv}{c_rst} (DB NOTIFY)", ts());
+                                        driver.unsubscribe(std::slice::from_ref(&pv)).await;
+                                        {
+                                            let mut new_map = (**shared_pv_cache.load()).clone();
+                                            new_map.remove(pv.as_str());
+                                            shared_pv_cache.store(Arc::new(new_map));
+                                        }
+                                        let _ = sqlx::query("UPDATE pv_status SET state = 6 WHERE pv_name = $1").bind(&pv).execute(&pool).await;
+                                        let _ = sqlx::query("INSERT INTO pv_events (pv_name, event_type, detail) VALUES ($1, 6, 'unsubscribed')").bind(&pv).execute(&pool).await;
+                                    }
+                                    aura_discover::IngestCommand::UnsubscribeBatch { pvs } => {
+                                        let count = pvs.len();
+                                        println!("{c_met}[{}]{c_rst} {c_id}pv {c_rst}  -{c_val}{count} PVs{c_rst} (DB NOTIFY batch)", ts());
+                                        driver.unsubscribe(&pvs).await;
+                                                        {
+                                            let mut new_map = (**shared_pv_cache.load()).clone();
+                                            for pv in &pvs { new_map.remove(pv.as_str()); }
+                                            shared_pv_cache.store(Arc::new(new_map));
+                                        }
+                                        let names: Vec<&str> = pvs.iter().map(|s| s.as_str()).collect();
+                                        let _ = sqlx::query("UPDATE pv_status SET state = 6 WHERE pv_name = ANY($1::text[])").bind(&names).execute(&pool).await;
+                                        let _ = sqlx::query(
+                                            "INSERT INTO pv_events (pv_name, event_type, detail) SELECT unnest($1::text[]), 6, 'batch unsubscribed'"
+                                        ).bind(&names).execute(&pool).await;
+                                    }
+                                    _ => {}
                                 }
                             }
-                            let new_pvs: Vec<String> = subscribe_pvs.into_iter()
-                                .filter(|pv| !driver.pv_server_cache().contains_key(pv))
-                                .collect();
-                            if new_pvs.is_empty() { continue; }
-                            let count = new_pvs.len();
-                            if count == 1 {
-                                println!("{c_met}[{}]{c_rst} {c_id}pv {c_rst}  +{c_val}{}{c_rst} (DB NOTIFY)", ts(), &new_pvs[0]);
-                            } else {
-                                println!("{c_met}[{}]{c_rst} {c_id}pv {c_rst}  +{c_val}{count} PVs{c_rst} (DB NOTIFY)", ts());
-                            }
-                            // Pre-register in pv_lookup + pv_cache BEFORE subscribing.
-                            // This ensures pv_id is resolvable when the first events arrive.
-                            let sub = handlers::subscribe_pvs(
-                                &pool, &mut driver, &mut engine, &shared_pv_cache,
-                                &new_pvs, "dynamic subscribe via NOTIFY",
-                            ).await;
-                            let ok_pvs = sub.ok_pvs;
-                            if sub.failed > 0 {
-                                let failed: Vec<&str> = new_pvs.iter()
-                                    .filter(|pv| !ok_pvs.iter().any(|ok| ok == *pv))
-                                    .map(|s| s.as_str()).take(5).collect();
-                                println!("{c_met}[{}]{c_rst} {c_warn}pv   {} PVs not found on any IOC (e.g. {:?}){c_rst}", ts(), sub.failed, failed);
-                            }
-                            if !ok_pvs.is_empty() {
-                                println!("{c_met}[{}]{c_rst} {c_ok}pv   {} PVs added to hot path{c_rst}", ts(), ok_pvs.len());
-                            }
                         }
-                        aura_discover::IngestCommand::Unsubscribe { pv } => {
-                            println!("{c_met}[{}]{c_rst} {c_id}pv {c_rst}  -{c_val}{pv}{c_rst} (DB NOTIFY)", ts());
-                            driver.unsubscribe(&[pv.clone()]).await;
-                            {
-                                let mut new_map = (**shared_pv_cache.load()).clone();
-                                new_map.remove(pv.as_str());
-                                shared_pv_cache.store(Arc::new(new_map));
-                            }
-                            let _ = sqlx::query("UPDATE pv_status SET state = 6 WHERE pv_name = $1").bind(&pv).execute(&pool).await;
-                            let _ = sqlx::query("INSERT INTO pv_events (pv_name, event_type, detail) VALUES ($1, 6, 'unsubscribed')").bind(&pv).execute(&pool).await;
-                        }
-                        aura_discover::IngestCommand::UnsubscribeBatch { pvs } => {
-                            let count = pvs.len();
-                            println!("{c_met}[{}]{c_rst} {c_id}pv {c_rst}  -{c_val}{count} PVs{c_rst} (DB NOTIFY batch)", ts());
-                            driver.unsubscribe(&pvs).await;
-                                            {
-                                let mut new_map = (**shared_pv_cache.load()).clone();
-                                for pv in &pvs { new_map.remove(pv.as_str()); }
-                                shared_pv_cache.store(Arc::new(new_map));
-                            }
-                            let names: Vec<&str> = pvs.iter().map(|s| s.as_str()).collect();
-                            let _ = sqlx::query("UPDATE pv_status SET state = 6 WHERE pv_name = ANY($1::text[])").bind(&names).execute(&pool).await;
-                            let _ = sqlx::query(
-                                "INSERT INTO pv_events (pv_name, event_type, detail) SELECT unnest($1::text[]), 6, 'batch unsubscribed'"
-                            ).bind(&names).execute(&pool).await;
-                        }
-                        _ => {}
-                    }
-                }
-            }
 
-            _ = tokio::signal::ctrl_c() => { break; }
-            _ = sigterm.recv() => { shutdown_signal = "SIGTERM"; break; }
-        }
+                        _ = tokio::signal::ctrl_c() => { break; }
+                        _ = sigterm.recv() => { shutdown_signal = "SIGTERM"; break; }
+                    }
     }
 
     println!("\n{c_met}[shutdown]{c_rst} Signal {shutdown_signal} received — draining...");

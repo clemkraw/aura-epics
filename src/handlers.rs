@@ -57,14 +57,13 @@ pub async fn subscribe_pvs(
     .bind(&names)
     .fetch_all(pool)
     .await
+        && !rows.is_empty()
     {
-        if !rows.is_empty() {
-            let mut new_map = (**pv_cache.load()).clone();
-            for (name, id) in &rows {
-                new_map.insert(Arc::from(name.as_str()), *id);
-            }
-            pv_cache.store(Arc::new(new_map));
+        let mut new_map = (**pv_cache.load()).clone();
+        for (name, id) in &rows {
+            new_map.insert(Arc::from(name.as_str()), *id);
         }
+        pv_cache.store(Arc::new(new_map));
     }
 
     // Subscribe via PVA driver.
@@ -102,20 +101,20 @@ pub async fn subscribe_pvs(
     .bind(&ok_names)
     .fetch_all(pool)
     .await
+        && !rows.is_empty()
     {
-        if !rows.is_empty() {
-            let pv_ids: Vec<i32> = rows.iter().map(|(_, id)| *id).collect();
-            let row_names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
-            {
-                let mut new_map = (**pv_cache.load()).clone();
-                for (name, id) in &rows {
-                    new_map.insert(Arc::from(name.as_str()), *id);
-                }
-                pv_cache.store(Arc::new(new_map));
+        let pv_ids: Vec<i32> = rows.iter().map(|(_, id)| *id).collect();
+        let row_names: Vec<&str> = rows.iter().map(|(n, _)| n.as_str()).collect();
+        {
+            let mut new_map = (**pv_cache.load()).clone();
+            for (name, id) in &rows {
+                new_map.insert(Arc::from(name.as_str()), *id);
             }
+            pv_cache.store(Arc::new(new_map));
+        }
 
-            // Update pv_status + log pv_events.
-            if let Err(e) = sqlx::query(
+        // Update pv_status + log pv_events.
+        if let Err(e) = sqlx::query(
                 "INSERT INTO pv_status (pv_name, pv_id, state, subscribed_at) \
                  SELECT t.pv_name, t.pv_id, 3, NOW() \
                  FROM UNNEST($1::text[], $2::int[]) AS t(pv_name, pv_id) \
@@ -124,19 +123,18 @@ pub async fn subscribe_pvs(
                 tracing::debug!("pv_status subscribe: {e}");
             }
 
-            if let Err(e) = sqlx::query(
-                "INSERT INTO pv_events (pv_name, pv_id, event_type, detail) \
+        if let Err(e) = sqlx::query(
+            "INSERT INTO pv_events (pv_name, pv_id, event_type, detail) \
                  SELECT t.pv_name, t.pv_id, 0, $3 \
                  FROM UNNEST($1::text[], $2::int[]) AS t(pv_name, pv_id)",
-            )
-            .bind(&row_names)
-            .bind(&pv_ids)
-            .bind(detail)
-            .execute(pool)
-            .await
-            {
-                tracing::debug!("pv_events subscribe: {e}");
-            }
+        )
+        .bind(&row_names)
+        .bind(&pv_ids)
+        .bind(detail)
+        .execute(pool)
+        .await
+        {
+            tracing::debug!("pv_events subscribe: {e}");
         }
     }
 
@@ -178,7 +176,7 @@ pub async fn collect_initial_metadata(
     let metas = std::mem::take(&mut engine.pending_metadata);
     let stored: Vec<aura_store::metadata::StoredMetadata> = metas
         .iter()
-        .map(|m| aura_store::metadata::StoredMetadata::from_core(m))
+        .map(aura_store::metadata::StoredMetadata::from_core)
         .collect();
 
     match aura_store::metadata::MetadataDao::upsert_batch(pool, &stored).await {
@@ -369,7 +367,7 @@ pub async fn drain_metadata(
     if !metas.is_empty() {
         let stored: Vec<aura_store::metadata::StoredMetadata> = metas
             .iter()
-            .map(|m| aura_store::metadata::StoredMetadata::from_core(m))
+            .map(aura_store::metadata::StoredMetadata::from_core)
             .filter(|m| !metadata_stored_pvs.contains(&m.pv_name))
             .collect();
         if !stored.is_empty() {
@@ -386,10 +384,12 @@ pub async fn drain_metadata(
     }
 }
 
+type PvStatsSink = Mutex<Vec<HashMap<i32, (u64, f64, i16)>>>;
+
 /// Drain per-PV stats, update pv_status, detect timeouts, compute health score.
 pub async fn update_pv_status(
     pool: &PgPool,
-    pv_stats_sink: &Mutex<Vec<HashMap<i32, (u64, f64, i16)>>>,
+    pv_stats_sink: &PvStatsSink,
     pv_cache: &arc_swap::ArcSwap<HashMap<Arc<str>, i32>>,
     shared_buf: &aura_store::writer::shared_buf::SharedBuffer,
 ) {

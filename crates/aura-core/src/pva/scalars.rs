@@ -350,16 +350,16 @@ mod tests {
                 Some(u64::MAX as f64),
             ),
             (
-                ScalarValue::Float(3.14),
+                ScalarValue::Float(3.96),
                 ScalarType::Float,
-                "3.14",
-                Some(3.14f32 as f64),
+                "3.96",
+                Some(3.96f32 as f64),
             ),
             (
-                ScalarValue::Double(2.71828),
+                ScalarValue::Double(2.9658),
                 ScalarType::Double,
-                "2.71828",
-                Some(2.71828),
+                "2.9658",
+                Some(2.9658),
             ),
             (
                 ScalarValue::String("aura".into()),
@@ -567,10 +567,10 @@ mod tests {
         for (v, _, _, _) in all_variants() {
             let json = serde_json::to_string(&v).unwrap();
             let back: ScalarValue = serde_json::from_str(&json).unwrap();
-            if let Some(f) = v.as_f64() {
-                if f.is_nan() {
-                    continue;
-                }
+            if let Some(f) = v.as_f64()
+                && f.is_nan()
+            {
+                continue;
             }
             assert_eq!(v, back, "{v:?}");
         }

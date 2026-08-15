@@ -490,6 +490,7 @@ impl std::error::Error for DecodeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::E;
 
     fn le_reader(data: &[u8]) -> PvaReader<'_> {
         PvaReader::new(data, ByteOrder::LittleEndian)
@@ -931,8 +932,8 @@ mod tests {
             w.write_u32(0xDEADBEEF);
             w.write_i64(0x0102030405060708);
             w.write_u64(0xFFFFFFFFFFFFFFFF);
-            w.write_f32(3.14);
-            w.write_f64(2.718281828);
+            w.write_f32(3.96);
+            w.write_f64(E);
 
             let mut r = PvaReader::new(w.as_bytes(), order);
             assert!(r.read_bool().unwrap());
@@ -944,8 +945,8 @@ mod tests {
             assert_eq!(r.read_u32().unwrap(), 0xDEADBEEF);
             assert_eq!(r.read_i64().unwrap(), 0x0102030405060708);
             assert_eq!(r.read_u64().unwrap(), 0xFFFFFFFFFFFFFFFF);
-            assert!((r.read_f32().unwrap() - 3.14).abs() < 0.001);
-            assert!((r.read_f64().unwrap() - 2.718281828).abs() < 1e-9);
+            assert!((r.read_f32().unwrap() - 3.96).abs() < 0.001);
+            assert!((r.read_f64().unwrap() - E).abs() < 1e-9);
             assert!(r.is_empty());
         }
     }

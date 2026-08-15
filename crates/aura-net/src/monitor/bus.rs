@@ -81,8 +81,14 @@ impl MonitorBusRx {
         }
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.rx.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.rx.is_empty()
     }
 }
 
@@ -213,13 +219,13 @@ mod tests {
     #[test]
     fn send_recv_scalar_value() {
         let (tx, mut rxs) = create_bus(1, 64);
-        let (name, id, ev) = scalar("PV:T", 7, 3.14);
+        let (name, id, ev) = scalar("PV:T", 7, 3.96);
         tx.send_to_shard(name, id, 0, ev).unwrap();
         let mut buf = Vec::new();
         rxs[0].drain_into(&mut buf, 10);
         assert_eq!(buf.len(), 1);
         if let MonitorEvent::ScalarDelta { value, .. } = &buf[0].event {
-            assert!((value - 3.14).abs() < f64::EPSILON);
+            assert!((value - 3.96).abs() < f64::EPSILON);
         } else {
             panic!("expected ScalarDelta");
         }
