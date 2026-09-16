@@ -63,6 +63,10 @@ impl std::fmt::Display for DriverError {
 /// Lifecycle event emitted by event loops to the main loop.
 #[derive(Debug, Clone)]
 pub enum LifecycleEvent {
+    Connected {
+        addr: SocketAddr,
+        pvs: Vec<String>,
+    },
     Disconnected {
         addr: SocketAddr,
         pvs: Vec<String>,
@@ -419,6 +423,26 @@ impl PvaDriver {
                     pv.clone(),
                     Err(DriverError::SearchFailed("not found".into())),
                 ));
+            }
+        }
+
+        // Group the PVs that actually connected by the crate that answered.
+        // pv_server_cache was filled in PHASE C above, so this is the one
+        // place that sees both paths — existing sessions and new ones.
+        {
+            let mut by_ioc: HashMap<SocketAddr, Vec<String>> = HashMap::new();
+            for (pv, res) in &results {
+                if res.is_ok()
+                    && let Some(addr) = self.pv_server_cache.get(pv)
+                {
+                    by_ioc.entry(*addr).or_default().push(pv.clone());
+                }
+            }
+            for (addr, pvs) in by_ioc {
+                // try_send, like the other lifecycle events: a full channel
+                // must never block discovery. The cost of a dropped event is
+                // a stale ioc_addr until the next subscribe, not data loss.
+                let _ = self.lifecycle_tx.try_send(LifecycleEvent::Connected { addr, pvs });
             }
         }
 
