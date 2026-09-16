@@ -1,5 +1,6 @@
 mod banner;
 mod handlers;
+mod ui;
 
 use std::error::Error;
 use std::sync::Arc;
@@ -123,6 +124,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
         report.applied_count(),
         report.skipped_count()
     );
+
+    let api_cancel = tokio_util::sync::CancellationToken::new();
+    {
+        let addr_str =
+            std::env::var("AURA_API_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+        let addr: std::net::SocketAddr = match addr_str.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                println!(
+                    "{c_met}[{}]{c_rst} {c_err}api  FATAL: invalid AURA_API_ADDR '{addr_str}': {e}{c_rst}",
+                    ts()
+                );
+                std::process::exit(1);
+            }
+        };
+
+        let state = aura_api::ApiState { pool: pool.clone() };
+        let app = ui::attach(aura_api::router(state));
+        let cancel = api_cancel.clone();
+
+        std::thread::Builder::new()
+            .name("api".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("api-worker")
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!("api runtime build failed: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = rt.block_on(aura_api::serve(app, addr, cancel)) {
+                    tracing::error!("api server stopped: {e}");
+                }
+            })?;
+
+        println!(
+            "{c_met}[{}]{c_rst} {c_ok}api  Listening on {c_val}http://{addr}{c_rst}",
+            ts()
+        );
+    }
 
     println!(
         "{c_met}[{}]{c_rst} {c_id}sto{c_rst}  Building storage pipeline...",
@@ -580,6 +626,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         Some(event) = lifecycle_rx.recv() => {
                             use aura_net::runtime::driver::LifecycleEvent;
                             match event {
+                                LifecycleEvent::Connected { addr, pvs } => {
+                                    let n = pvs.len();
+                                    println!("{c_met}[{}]{c_rst} {c_ok}net  IOC {addr} connected ({n} PVs){c_rst}", ts());
+                                    handlers::handle_connect(&pool, addr, &pvs).await;
+                                }
                                 LifecycleEvent::Disconnected { addr, pvs, reason } => {
                                     ingest_metrics.disconnects.fetch_add(1, Ordering::Relaxed);
                                     let n = pvs.len();
@@ -987,6 +1038,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     println!("\n{c_met}[shutdown]{c_rst} Signal {shutdown_signal} received — draining...");
+
+    api_cancel.cancel();
 
     // Ordered shutdown — each stage stops feeding the next before the next
     // one drains, so the final flush sees every event:
