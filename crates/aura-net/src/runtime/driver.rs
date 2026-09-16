@@ -442,7 +442,9 @@ impl PvaDriver {
                 // try_send, like the other lifecycle events: a full channel
                 // must never block discovery. The cost of a dropped event is
                 // a stale ioc_addr until the next subscribe, not data loss.
-                let _ = self.lifecycle_tx.try_send(LifecycleEvent::Connected { addr, pvs });
+                let _ = self
+                    .lifecycle_tx
+                    .try_send(LifecycleEvent::Connected { addr, pvs });
             }
         }
 

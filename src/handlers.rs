@@ -200,11 +200,7 @@ pub async fn collect_initial_metadata(
 /// This is the only place `pv_status.ioc_addr` is ever written. The column
 /// exists in migration 014 and has been NULL since — every per-crate metric
 /// in the API depends on it.
-pub async fn handle_connect(
-    pool: &PgPool,
-    addr: SocketAddr,
-    pvs: &[String],
-) {
+pub async fn handle_connect(pool: &PgPool, addr: SocketAddr, pvs: &[String]) {
     if pvs.is_empty() {
         return;
     }
@@ -218,22 +214,22 @@ pub async fn handle_connect(
            state = 2, ioc_addr = $2, connected_at = NOW() \
          WHERE pv_name = ANY($1::text[]) AND state IN (0, 1, 4, 5)",
     )
-        .bind(&names)
-        .bind(&addr_str)
-        .execute(pool)
-        .await
+    .bind(&names)
+    .bind(&addr_str)
+    .execute(pool)
+    .await
     {
         tracing::debug!("pv_status connect update: {e}");
     }
-    
+
     if let Err(e) = sqlx::query(
         "UPDATE pv_status SET ioc_addr = $2 \
          WHERE pv_name = ANY($1::text[]) AND ioc_addr IS DISTINCT FROM $2",
     )
-        .bind(&names)
-        .bind(&addr_str)
-        .execute(pool)
-        .await
+    .bind(&names)
+    .bind(&addr_str)
+    .execute(pool)
+    .await
     {
         tracing::debug!("pv_status ioc_addr refresh: {e}");
     }
@@ -243,10 +239,10 @@ pub async fn handle_connect(
          SELECT l.pv_name, l.pv_id, 1, $2 \
          FROM pv_lookup l WHERE l.pv_name = ANY($1::text[])",
     )
-        .bind(&names)
-        .bind(&addr_str)
-        .execute(pool)
-        .await
+    .bind(&names)
+    .bind(&addr_str)
+    .execute(pool)
+    .await
     {
         tracing::debug!("pv_events connect insert: {e}");
     }
