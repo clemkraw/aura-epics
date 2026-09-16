@@ -27,6 +27,13 @@ CREATE INDEX IF NOT EXISTS idx_pv_events_pv_ts
     ON pv_events (pv_name, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_pv_events_type_ts
     ON pv_events (event_type, ts DESC);
+-- Per-crate lifecycle: the 24h counters and the "latest error" lookup both
+-- scan backwards in time within one IOC, hence (ioc_addr, ts DESC).
+-- Partial because only disconnect, reconnect and IOC-removed events carry
+-- an address.
+CREATE INDEX IF NOT EXISTS idx_pv_events_ioc_ts
+    ON pv_events (ioc_addr, ts DESC)
+    WHERE ioc_addr IS NOT NULL;
 
 -- Compression after 24h (low-traffic table).
 ALTER TABLE pv_events
@@ -46,7 +53,7 @@ CREATE TABLE IF NOT EXISTS pv_status
     pv_name       TEXT PRIMARY KEY,
     pv_id         INTEGER,
     state         SMALLINT NOT NULL DEFAULT 0,
-    -- 0=INIT 1=SEARCHING 2=CONNECTED 3=ARCHIVING 4=DISCONNECTED 5=TIMEOUT
+    -- 0=INIT 1=SEARCHING 2=CONNECTED 3=ARCHIVING 4=DISCONNECTED 5=TIMEOUT 6=UNSUBSCRIBED
     ioc_addr      TEXT,
     subscribed_at TIMESTAMPTZ,
     connected_at  TIMESTAMPTZ,
@@ -68,6 +75,12 @@ ALTER TABLE pv_status
         autovacuum_vacuum_cost_delay = 0, -- full speed on this small table
         autovacuum_analyze_scale_factor = 0.05
         );
+
+-- GROUP BY ioc_addr for the IOC view. The column is written on connect and
+-- reconnect only, so the index is effectively read-only at runtime.
+CREATE INDEX IF NOT EXISTS idx_pv_status_ioc
+    ON pv_status (ioc_addr)
+    WHERE ioc_addr IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_pv_status_state
     ON pv_status (state);
