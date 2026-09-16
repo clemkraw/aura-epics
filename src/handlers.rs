@@ -116,9 +116,9 @@ pub async fn subscribe_pvs(
         // Update pv_status + log pv_events.
         if let Err(e) = sqlx::query(
                 "INSERT INTO pv_status (pv_name, pv_id, state, subscribed_at) \
-                 SELECT t.pv_name, t.pv_id, 3, NOW() \
+                 SELECT t.pv_name, t.pv_id, 1, NOW() \
                  FROM UNNEST($1::text[], $2::int[]) AS t(pv_name, pv_id) \
-                 ON CONFLICT (pv_name) DO UPDATE SET state = 3, pv_id = EXCLUDED.pv_id, subscribed_at = NOW()"
+                 ON CONFLICT (pv_name) DO UPDATE SET state = 1, pv_id = EXCLUDED.pv_id, subscribed_at = NOW()"
             ).bind(&row_names).bind(&pv_ids).execute(pool).await {
                 tracing::debug!("pv_status subscribe: {e}");
             }
@@ -191,6 +191,64 @@ pub async fn collect_initial_metadata(
             tracing::error!("metadata upsert: {e}");
             0
         }
+    }
+}
+
+/// Channels opened on `addr`: record which crate answered, when, and move
+/// the PVs to CONNECTED.
+///
+/// This is the only place `pv_status.ioc_addr` is ever written. The column
+/// exists in migration 014 and has been NULL since — every per-crate metric
+/// in the API depends on it.
+pub async fn handle_connect(
+    pool: &PgPool,
+    addr: SocketAddr,
+    pvs: &[String],
+) {
+    if pvs.is_empty() {
+        return;
+    }
+    let names: Vec<&str> = pvs.iter().map(String::as_str).collect();
+    let addr_str = addr.to_string();
+
+    // Only from SEARCHING or DISCONNECTED: a PV already ARCHIVING has
+    // received data, and moving it back to CONNECTED would lose that.
+    if let Err(e) = sqlx::query(
+        "UPDATE pv_status SET \
+           state = 2, ioc_addr = $2, connected_at = NOW() \
+         WHERE pv_name = ANY($1::text[]) AND state IN (0, 1, 4, 5)",
+    )
+        .bind(&names)
+        .bind(&addr_str)
+        .execute(pool)
+        .await
+    {
+        tracing::debug!("pv_status connect update: {e}");
+    }
+    
+    if let Err(e) = sqlx::query(
+        "UPDATE pv_status SET ioc_addr = $2 \
+         WHERE pv_name = ANY($1::text[]) AND ioc_addr IS DISTINCT FROM $2",
+    )
+        .bind(&names)
+        .bind(&addr_str)
+        .execute(pool)
+        .await
+    {
+        tracing::debug!("pv_status ioc_addr refresh: {e}");
+    }
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO pv_events (pv_name, pv_id, event_type, ioc_addr) \
+         SELECT l.pv_name, l.pv_id, 1, $2 \
+         FROM pv_lookup l WHERE l.pv_name = ANY($1::text[])",
+    )
+        .bind(&names)
+        .bind(&addr_str)
+        .execute(pool)
+        .await
+    {
+        tracing::debug!("pv_events connect insert: {e}");
     }
 }
 
@@ -423,7 +481,8 @@ pub async fn update_pv_status(
         if let Err(e) = sqlx::query(
             "UPDATE pv_status s SET \
                last_event_at = NOW(), events_total = s.events_total + t.cnt, \
-               update_hz = t.hz, last_value = t.val, last_severity = t.sev \
+               update_hz = t.hz, last_value = t.val, last_severity = t.sev, \
+               state = CASE WHEN s.state = 2 THEN 3 ELSE s.state END \
              FROM UNNEST($1::int[], $2::bigint[], $3::real[], $4::float8[], $5::smallint[]) \
                AS t(pv_id, cnt, hz, val, sev) WHERE s.pv_id = t.pv_id",
         )
